@@ -97,6 +97,33 @@ impl CompactIndex {
         }
         result
     }
+    /// Cached membership: parent records precede children. No per-query filesystem I/O.
+    pub fn personal_mask(&self, roots: &[PathBuf]) -> Vec<bool> {
+        self.personal_mask_with_exclusions(roots, &default_personal_exclusions())
+    }
+    pub fn personal_mask_with_exclusions(
+        &self,
+        roots: &[PathBuf],
+        exclusions: &[String],
+    ) -> Vec<bool> {
+        let roots: HashSet<u64> = roots
+            .iter()
+            .map(|p| hash_path(&p.to_string_lossy()))
+            .collect();
+        let excluded_names: HashSet<&str> = exclusions.iter().map(String::as_str).collect();
+        let mut mask = vec![false; self.records.len()];
+        for (id, record) in self.records.iter().enumerate() {
+            let name = self.name(id);
+            let excluded = self.is_dir(id)
+                && (excluded_names.contains(name)
+                    || (excluded_names.contains(".*") && name.starts_with('.'))
+                    || (excluded_names.contains("*.app") && name.ends_with(".app")));
+            mask[id] = roots.contains(&self.path_hashes[id])
+                || (!excluded && record.parent != NO_PARENT && mask[record.parent as usize]);
+        }
+        mask
+    }
+
     fn from_flat(roots: Vec<PathBuf>, mut flat: Vec<FlatEntry>) -> Result<Self, String> {
         flat.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         flat.dedup_by(|a, b| a.path == b.path);
@@ -364,7 +391,7 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SortOrder {
     #[default]
     Relevance,
@@ -406,7 +433,123 @@ pub fn search_sorted_with_scope(
     if limit == 0 {
         return Vec::new();
     }
-    let mut results = search_filtered_with_scope(index, query, usize::MAX, category, include_paths);
+    let results = search_filtered_with_scope(index, query, usize::MAX, category, include_paths);
+    sort_hits(index, query, limit, category, order, results)
+}
+
+/// Apply scope/date predicates to all matches BEFORE selecting the global top results.
+pub fn search_with_filters(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    order: SortOrder,
+    include_paths: bool,
+    personal: Option<&[bool]>,
+    since: Option<i64>,
+) -> Vec<usize> {
+    search_with_options(
+        index,
+        query,
+        limit,
+        category,
+        order,
+        include_paths,
+        personal,
+        since,
+        false,
+    )
+}
+pub fn default_personal_exclusions() -> Vec<String> {
+    [
+        ".*",
+        "*.app",
+        "Library",
+        "node_modules",
+        "target",
+        "venv",
+        "__pycache__",
+        "dist",
+        "build",
+        "app-content",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+pub fn previewable_image(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| {
+        ["png", "jpg", "jpeg", "webp", "gif"]
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e))
+    })
+}
+pub fn search_with_options(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    order: SortOrder,
+    include_paths: bool,
+    personal: Option<&[bool]>,
+    since: Option<i64>,
+    raster: bool,
+) -> Vec<usize> {
+    if personal.is_none() && since.is_none() && !raster && !query.contains('/') {
+        return search_sorted_with_scope(index, query, limit, category, order, include_paths);
+    }
+    if limit == 0 {
+        return Vec::new();
+    }
+    let (path_terms, name_terms): (Vec<_>, Vec<_>) =
+        query.split_whitespace().partition(|t| t.contains('/'));
+    let name_query = name_terms.join(" ");
+    let mut hits = if name_query.is_empty() {
+        index
+            .records
+            .par_iter()
+            .enumerate()
+            .filter_map(|(id, _)| {
+                (index.is_alive(id)
+                    && (category == Category::All || index.category(id) == category)
+                    && personal.is_none_or(|m| m.get(id).copied().unwrap_or(false))
+                    && since.is_none_or(|s| index.modified(id).is_some_and(|d| d >= s)))
+                .then_some(id)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        search_filtered_with_scope(index, &name_query, usize::MAX, category, include_paths)
+    };
+    if !path_terms.is_empty() {
+        let path_query = path_terms
+            .iter()
+            .map(|t| t.trim_matches('/'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let path_hits =
+            search_filtered_with_scope(index, &path_query, usize::MAX, Category::All, true);
+        let mut membership = vec![false; index.records.len()];
+        for id in path_hits {
+            membership[id] = true;
+        }
+        hits.retain(|id| membership[*id]);
+    }
+    hits.retain(|id| {
+        (!raster || (index.category(*id) == Category::Image && previewable_image(index.name(*id))))
+            && personal.is_none_or(|m| m.get(*id).copied().unwrap_or(false))
+            && since.is_none_or(|s| index.modified(*id).is_some_and(|d| d >= s))
+    });
+    sort_hits(index, &name_query, limit, category, order, hits)
+}
+
+fn sort_hits(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    order: SortOrder,
+    mut results: Vec<usize>,
+) -> Vec<usize> {
     if order == SortOrder::Relevance {
         let query: Vec<u8> = query
             .bytes()
@@ -955,7 +1098,7 @@ fn should_skip(path: &Path) -> bool {
         .any(|prefix| path == Path::new(prefix) || path.starts_with(prefix))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Category {
     #[default]
     All,
@@ -1596,6 +1739,103 @@ mod tests {
             !roots
                 .iter()
                 .any(|root| root == std::path::Path::new("/Users/demo/Documents"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod personal_tests {
+    use super::*;
+    #[test]
+    fn scope_date_and_path_filter_before_limit() {
+        let paths = [
+            ("/Users/test/Documents/work/output/recent.png", 900),
+            ("/Users/test/Documents/work/output/old.png", 100),
+            ("/Users/test/Documents/work/comfy-output/baby.png", 850),
+            ("/Users/test/Documents/work/node_modules/output/no.png", 999),
+            ("/Users/test/Library/output/no.png", 1000),
+            ("/System/output/no.png", 1000),
+            ("/Users/test/Documents/work/output2/also.png", 820),
+            ("/Users/test/Documents/work/output/icon.svg", 810),
+            (
+                "/Users/test/Documents/work/output/unknown.png",
+                UNKNOWN_DATE,
+            ),
+            ("/Users/test/Documents/work/dist/output/no.png", 999),
+            (
+                "/Users/test/Documents/work/Test.app/Contents/output/no.png",
+                999,
+            ),
+        ];
+        let mut flat = Vec::new();
+        let mut dirs = HashSet::new();
+        for (path, date) in paths {
+            let mut parent = Path::new(path).parent();
+            while let Some(p) = parent {
+                dirs.insert(p.to_string_lossy().to_string());
+                parent = p.parent();
+            }
+            flat.push(FlatEntry {
+                path: path.into(),
+                is_dir: false,
+                modified: date,
+            });
+        }
+        flat.extend(dirs.into_iter().map(|p| FlatEntry {
+            path: p.into(),
+            is_dir: true,
+            modified: 0,
+        }));
+        let index = CompactIndex::from_flat(vec![PathBuf::from("/")], flat).unwrap();
+        let mask = index.personal_mask(&[PathBuf::from("/Users/test/Documents")]);
+        let run = |q, limit| {
+            search_with_filters(
+                &index,
+                q,
+                limit,
+                Category::Image,
+                SortOrder::Latest,
+                false,
+                Some(&mask),
+                Some(800),
+            )
+        };
+        assert_eq!(index.name(run("/output", 1)[0]), "recent.png");
+        assert_eq!(run("/output", 500).len(), 4);
+        assert_eq!(index.name(run("/output baby", 500)[0]), "baby.png");
+        assert_eq!(run("", 500).len(), 4);
+        assert_eq!(
+            search_with_options(
+                &index,
+                "/output",
+                500,
+                Category::Image,
+                SortOrder::Latest,
+                false,
+                Some(&mask),
+                Some(800),
+                true
+            )
+            .len(),
+            3
+        );
+        let mask = index.personal_mask(&[
+            PathBuf::from("/Users/test/Documents"),
+            PathBuf::from("/Users/test/Documents/work/node_modules/output"),
+        ]);
+        assert_eq!(
+            search_with_filters(
+                &index,
+                "",
+                500,
+                Category::Image,
+                SortOrder::Latest,
+                false,
+                Some(&mask),
+                Some(800)
+            )
+            .len(),
+            5
         );
     }
 }

@@ -17,7 +17,11 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
 };
 use miao_find::index::{self, Category, CompactIndex, IndexDelta, ScanMessage, SortOrder};
+mod filters;
+mod thumbnails;
+use filters::{Preferences, SavedFilter};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use thumbnails::Thumbnails;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -36,6 +40,18 @@ fn main() -> eframe::Result {
 }
 
 struct MiaoFindApp {
+    preferences: Preferences,
+    personal_mask: Vec<bool>,
+    raster: bool,
+    exclusion_text: String,
+    personal: bool,
+    recent: bool,
+    thumbnails_enabled: bool,
+    thumbnails: Thumbnails,
+    filter_signature: String,
+    scope_editor: bool,
+    save_editor: bool,
+    bookmark_name: String,
     index: CompactIndex,
     results: Vec<usize>,
     selected_result: Option<usize>,
@@ -78,6 +94,18 @@ impl MiaoFindApp {
                 let count = index.len();
                 let roots = index.roots().to_vec();
                 Self {
+                    preferences: Preferences::default(),
+                    personal_mask: Vec::new(),
+                    raster: false,
+                    exclusion_text: String::new(),
+                    personal: false,
+                    recent: false,
+                    thumbnails_enabled: false,
+                    thumbnails: Thumbnails::new(context.egui_ctx.clone()),
+                    filter_signature: String::new(),
+                    scope_editor: false,
+                    save_editor: false,
+                    bookmark_name: String::new(),
                     index,
                     results: Vec::new(),
                     selected_result: None,
@@ -112,6 +140,18 @@ impl MiaoFindApp {
                 }
             }
             Err(error) => Self {
+                preferences: Preferences::default(),
+                personal_mask: Vec::new(),
+                raster: false,
+                exclusion_text: String::new(),
+                personal: false,
+                recent: false,
+                thumbnails_enabled: false,
+                thumbnails: Thumbnails::new(context.egui_ctx.clone()),
+                filter_signature: String::new(),
+                scope_editor: false,
+                save_editor: false,
+                bookmark_name: String::new(),
                 index: CompactIndex::default(),
                 results: Vec::new(),
                 selected_result: None,
@@ -141,6 +181,14 @@ impl MiaoFindApp {
                 app_context: context.egui_ctx.clone(),
             },
         };
+        app.preferences = context
+            .storage
+            .and_then(|s| eframe::get_value(s, "search_preferences_v1"))
+            .unwrap_or_default();
+        app.personal_mask = app.index.personal_mask_with_exclusions(
+            &app.preferences.personal_roots,
+            &app.preferences.exclusions,
+        );
         if let Some(error) = hotkey_status {
             app.status = error;
         }
@@ -154,6 +202,97 @@ impl MiaoFindApp {
             repaint.request_repaint();
         });
         app
+    }
+
+    fn filter_windows(&mut self, context: &egui::Context) {
+        if self.scope_editor {
+            let mut open = true;
+            egui::Window::new("我的资料范围")
+                .open(&mut open)
+                .show(context, |ui| {
+                    ui.label("仅在这些目录及子目录的已有索引中搜索；添加范围不会自动建立索引。");
+                    ui.label("下面的排除规则只作用于‘我的资料’；明确添加的目录优先。");
+                    let mut remove = None;
+                    for (i, p) in self.preferences.personal_roots.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(p.to_string_lossy());
+                            if ui.small_button("移除").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        self.preferences.personal_roots.remove(i);
+                        self.filter_signature.clear();
+                    }
+                    if ui.button("添加目录…").clicked() {
+                        if let Some(paths) = rfd::FileDialog::new().pick_folders() {
+                            self.preferences.personal_roots.extend(paths);
+                            self.preferences.personal_roots.sort();
+                            self.preferences.personal_roots.dedup();
+                            self.filter_signature.clear();
+                        }
+                    }
+                    if ui.button("恢复默认范围").clicked() {
+                        self.preferences.personal_roots = filters::default_roots();
+                        self.preferences.exclusions = index::default_personal_exclusions();
+                        self.exclusion_text = self.preferences.exclusions.join("\n");
+                        self.filter_signature.clear();
+                    }
+                    ui.collapsing("编辑排除规则（每行一个目录名）", |ui| {
+                        ui.label(".* 表示隐藏目录，*.app 表示应用包；其他规则按目录名精确匹配。");
+                        ui.add(egui::TextEdit::multiline(&mut self.exclusion_text).desired_rows(5));
+                        if ui.button("应用排除规则").clicked() {
+                            self.preferences.exclusions = self
+                                .exclusion_text
+                                .lines()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                            self.filter_signature.clear();
+                        }
+                    });
+                    if self.filter_signature.is_empty() {
+                        self.personal_mask = self.index.personal_mask_with_exclusions(
+                            &self.preferences.personal_roots,
+                            &self.preferences.exclusions,
+                        );
+                    }
+                });
+            self.scope_editor = open;
+        }
+        if self.save_editor {
+            let mut open = true;
+            egui::Window::new("保存常用筛选")
+                .open(&mut open)
+                .show(context, |ui| {
+                    ui.label("保存关键词、分类、范围、日期、排序和缩略图设置；下次可一键恢复。");
+                    ui.text_edit_singleline(&mut self.bookmark_name);
+                    if ui
+                        .add_enabled(
+                            !self.bookmark_name.trim().is_empty(),
+                            egui::Button::new("保存"),
+                        )
+                        .clicked()
+                    {
+                        let filter = self.current_filter();
+                        if let Some(existing) = self
+                            .preferences
+                            .saved
+                            .iter_mut()
+                            .find(|f| f.name == filter.name)
+                        {
+                            *existing = filter;
+                        } else {
+                            self.preferences.saved.push(filter);
+                        }
+                        self.save_editor = false;
+                        self.bookmark_name.clear();
+                    }
+                });
+            self.save_editor &= open;
+        }
     }
 
     fn start_dates(&mut self) {
@@ -183,6 +322,11 @@ impl MiaoFindApp {
                         self.status = format!("日期缓存保存失败：{error}");
                     }
                     self.last_query.clear();
+                    self.filter_signature.clear();
+                    self.personal_mask = self.index.personal_mask_with_exclusions(
+                        &self.preferences.personal_roots,
+                        &self.preferences.exclusions,
+                    );
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     self.date_receiver = Some(receiver);
@@ -250,6 +394,11 @@ impl MiaoFindApp {
                     self.update_receiver = None;
                     self.scanning = false;
                     self.last_query.clear();
+                    self.filter_signature.clear();
+                    self.personal_mask = self.index.personal_mask_with_exclusions(
+                        &self.preferences.personal_roots,
+                        &self.preferences.exclusions,
+                    );
                     self.status = format!(
                         "索引完成：{} 项，用时 {:.1} 秒",
                         self.index.len(),
@@ -368,28 +517,73 @@ impl MiaoFindApp {
         match self.index.apply_delta(delta) {
             Ok(()) => {
                 self.last_query.clear();
+                self.filter_signature.clear();
+                self.personal_mask = self.index.personal_mask_with_exclusions(
+                    &self.preferences.personal_roots,
+                    &self.preferences.exclusions,
+                );
                 self.status = format!("索引已自动更新，当前共 {} 项", self.index.len());
             }
             Err(error) => self.status = format!("增量索引更新失败：{error}"),
         }
     }
 
+    fn apply_filter(&mut self, filter: SavedFilter) {
+        self.query = filter.query;
+        self.category = filter.category;
+        self.sort_order = filter.order;
+        self.include_paths = filter.paths;
+        self.personal = filter.personal;
+        self.recent = filter.recent;
+        self.thumbnails_enabled = filter.thumbnails;
+        self.raster = filter.raster;
+        self.filter_signature.clear();
+    }
+    fn current_filter(&self) -> SavedFilter {
+        SavedFilter {
+            name: self.bookmark_name.trim().into(),
+            query: self.query.clone(),
+            category: self.category,
+            order: self.sort_order,
+            paths: self.include_paths,
+            personal: self.personal,
+            recent: self.recent,
+            thumbnails: self.thumbnails_enabled,
+            raster: self.raster,
+        }
+    }
     fn update_search(&mut self) {
+        let signature = format!(
+            "{}:{}:{}:{}",
+            self.personal,
+            self.recent,
+            self.raster,
+            if self.recent {
+                filters::seven_days_ago() / 60_000
+            } else {
+                0
+            }
+        );
+
         if self.query == self.last_query
             && self.category == self.last_category
             && self.sort_order == self.last_sort_order
             && self.include_paths == self.last_include_paths
+            && signature == self.filter_signature
         {
             return;
         }
         let started = Instant::now();
-        self.results = index::search_sorted_with_scope(
+        self.results = index::search_with_options(
             &self.index,
             &self.query,
             500,
             self.category,
             self.sort_order,
             self.include_paths,
+            self.personal.then_some(self.personal_mask.as_slice()),
+            self.recent.then(filters::seven_days_ago),
+            self.raster,
         );
         if !self
             .selected_result
@@ -398,6 +592,7 @@ impl MiaoFindApp {
             self.selected_result = self.results.first().copied();
         }
         self.query_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        self.filter_signature = signature;
         self.last_query.clone_from(&self.query);
         self.last_category = self.category;
         self.last_sort_order = self.sort_order;
@@ -557,6 +752,9 @@ fn install_chinese_font(context: &egui::Context) {
 }
 
 impl eframe::App for MiaoFindApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "search_preferences_v1", &self.preferences);
+    }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.index.persist();
     }
@@ -580,6 +778,11 @@ impl eframe::App for MiaoFindApp {
         self.receive_scan_updates(&context);
         self.receive_file_updates(&context);
         self.receive_dates(&context);
+        self.thumbnails.receive(&context);
+        if self.recent {
+            context.request_repaint_after(std::time::Duration::from_secs(60));
+        }
+        self.filter_windows(&context);
         egui::Panel::top("search_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("随手找 v{}", env!("CARGO_PKG_VERSION"))).strong());
@@ -649,6 +852,53 @@ impl eframe::App for MiaoFindApp {
                     .inner
                 })
                 .inner;
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.personal, false, "全部位置");
+                ui.selectable_value(&mut self.personal, true, "我的资料");
+                if ui.small_button("范围…").clicked() {
+                    self.exclusion_text = self.preferences.exclusions.join("\n");
+                    self.scope_editor = true;
+                }
+                ui.separator();
+                ui.add_enabled_ui(self.index.dates_ready(), |ui| {
+                    ui.checkbox(&mut self.recent, "最近 7 天")
+                        .on_hover_text("按修改日期：过去 7 × 24 小时；不是最近打开时间");
+                });
+                ui.checkbox(&mut self.thumbnails_enabled, "图片缩略图");
+                ui.checkbox(&mut self.raster, "仅可预览图片")
+                    .on_hover_text("PNG / JPEG / WebP / GIF；取消后显示其他格式");
+                if ui.button("保存筛选…").clicked() {
+                    self.save_editor = true;
+                }
+                ui.menu_button("常用筛选", |ui| {
+                    if ui.button("最近生成的图片").clicked() {
+                        self.apply_filter(SavedFilter::recent_images());
+                        ui.close();
+                    }
+                    let saved = self.preferences.saved.clone();
+                    for (i, f) in saved.into_iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.button(&f.name).clicked() {
+                                self.apply_filter(f.clone());
+                                ui.close();
+                            }
+                            if ui.small_button("删除").clicked() {
+                                self.preferences.saved.remove(i);
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+            });
+            if self.personal {
+                ui.label(
+                    RichText::new(format!(
+                        "我的资料 · {} 个目录（可在‘范围’中查看）",
+                        self.preferences.personal_roots.len()
+                    ))
+                    .small(),
+                );
+            }
             if context.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if self.query.is_empty() {
                     context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -700,7 +950,12 @@ impl eframe::App for MiaoFindApp {
                             .selected(self.category == kind),
                     )
                     .clicked()
-                    .then(|| self.category = kind);
+                    .then(|| {
+                        self.category = kind;
+                        if kind != Category::Image {
+                            self.raster = false;
+                        }
+                    });
                 }
             });
         egui::CentralPanel::default()
@@ -767,91 +1022,133 @@ impl eframe::App for MiaoFindApp {
                 }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show_rows(ui, 27.0, self.results.len(), |ui, range| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        for row in range {
-                            let id = self.results[row];
-                            let path = self.index.path(id);
-                            let parent = std::path::Path::new(&path)
-                                .parent()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let name = format!(
-                                "{}  {}",
-                                self.index.category(id).icon(),
-                                self.index.name(id)
-                            );
-                            let date = format_modified(self.index.modified(id));
-                            let selected = self.selected_result == Some(id);
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 27.0),
-                                egui::Sense::click(),
-                            );
-                            let bg = if selected {
-                                Color32::from_rgb(25, 85, 170)
-                            } else if response.hovered() {
-                                Color32::from_rgb(232, 240, 250)
-                            } else {
-                                Color32::WHITE
-                            };
-                            ui.painter().rect_filled(rect, 0.0, bg);
-                            let color = if selected {
-                                Color32::WHITE
-                            } else {
-                                Color32::from_rgb(20, 20, 20)
-                            };
-                            let mut cell = |offset: f32, cell_width: f32, text: &str| {
-                                let clip = egui::Rect::from_min_size(
-                                    rect.min + egui::vec2(offset + 4.0, 0.0),
-                                    egui::vec2(cell_width - 8.0, 27.0),
+                    .show_rows(
+                        ui,
+                        if self.thumbnails_enabled { 72.0 } else { 27.0 },
+                        self.results.len(),
+                        |ui, range| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for row in range {
+                                let height = if self.thumbnails_enabled { 72.0 } else { 27.0 };
+                                let id = self.results[row];
+                                let path = self.index.path(id);
+                                let parent = std::path::Path::new(&path)
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let name = format!(
+                                    "{}  {}",
+                                    self.index.category(id).icon(),
+                                    self.index.name(id)
                                 );
-                                ui.scope_builder(
-                                    egui::UiBuilder::new()
-                                        .max_rect(clip)
-                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(text).size(14.0).color(color),
+                                let date = format_modified(self.index.modified(id));
+                                let selected = self.selected_result == Some(id);
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), height),
+                                    egui::Sense::click(),
+                                );
+                                let bg = if selected {
+                                    Color32::from_rgb(25, 85, 170)
+                                } else if response.hovered() {
+                                    Color32::from_rgb(232, 240, 250)
+                                } else {
+                                    Color32::WHITE
+                                };
+                                ui.painter().rect_filled(rect, 0.0, bg);
+                                let color = if selected {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::from_rgb(20, 20, 20)
+                                };
+                                let preview_width = if self.thumbnails_enabled
+                                    && self.index.category(id) == Category::Image
+                                {
+                                    if let Some(texture) = self.thumbnails.get(
+                                        &context,
+                                        &path,
+                                        self.index.modified(id),
+                                    ) {
+                                        let size = texture.size_vec2();
+                                        let fit = size * (60.0 / size.x.max(size.y));
+                                        let thumbnail_rect = egui::Rect::from_center_size(
+                                            rect.min + egui::vec2(34.0, height / 2.0),
+                                            fit,
+                                        );
+                                        ui.painter().image(
+                                            texture.id(),
+                                            thumbnail_rect,
+                                            egui::Rect::from_min_max(
+                                                egui::Pos2::ZERO,
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().text(
+                                            rect.min + egui::vec2(34.0, height / 2.0),
+                                            egui::Align2::CENTER_CENTER,
+                                            "图片",
+                                            egui::FontId::proportional(12.0),
+                                            color,
+                                        );
+                                    }
+                                    68.0
+                                } else {
+                                    0.0
+                                };
+                                let mut cell = |offset: f32, cell_width: f32, text: &str| {
+                                    let clip = egui::Rect::from_min_size(
+                                        rect.min + egui::vec2(offset + 4.0, 0.0),
+                                        egui::vec2(cell_width - 8.0, height),
+                                    );
+                                    ui.scope_builder(
+                                        egui::UiBuilder::new().max_rect(clip).layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                        ),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(text).size(14.0).color(color),
+                                                )
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
                                             )
-                                            .truncate()
-                                            .sense(egui::Sense::click()),
-                                        )
-                                    },
-                                )
-                                .inner
-                            };
-                            let response = response
-                                .union(cell(0.0, name_width, &name))
-                                .union(cell(name_width + 8.0, path_width, &parent))
-                                .union(cell(name_width + path_width + 16.0, date_width, &date));
-                            let response = response.on_hover_text(&path);
-                            if response.clicked() {
-                                self.selected_result = Some(id);
-                            }
-                            if response.double_clicked() {
-                                if let Err(e) = Self::open(&path) {
-                                    self.status = e;
+                                        },
+                                    )
+                                    .inner
+                                };
+                                let response = response
+                                    .union(cell(preview_width, name_width - preview_width, &name))
+                                    .union(cell(name_width + 8.0, path_width, &parent))
+                                    .union(cell(name_width + path_width + 16.0, date_width, &date));
+                                let response = response.on_hover_text(&path);
+                                if response.clicked() {
+                                    self.selected_result = Some(id);
                                 }
-                            }
-                            response.context_menu(|ui| {
-                                if ui.button("打开").clicked() {
+                                if response.double_clicked() {
                                     if let Err(e) = Self::open(&path) {
                                         self.status = e;
                                     }
-                                    ui.close();
                                 }
-                                if ui.button("在 Finder 中显示").clicked() {
-                                    Self::reveal(&path);
-                                    ui.close();
-                                }
-                                if ui.button("复制完整路径").clicked() {
-                                    ui.ctx().copy_text(path.clone());
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
+                                response.context_menu(|ui| {
+                                    if ui.button("打开").clicked() {
+                                        if let Err(e) = Self::open(&path) {
+                                            self.status = e;
+                                        }
+                                        ui.close();
+                                    }
+                                    if ui.button("在 Finder 中显示").clicked() {
+                                        Self::reveal(&path);
+                                        ui.close();
+                                    }
+                                    if ui.button("复制完整路径").clicked() {
+                                        ui.ctx().copy_text(path.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        },
+                    );
             });
         if self.scanning {
             context.request_repaint_after(std::time::Duration::from_millis(100));
