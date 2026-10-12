@@ -1,6 +1,6 @@
 [package]
 name = "miao-find"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 description = "A fast filename search app for macOS"
 license = "MIT"
@@ -10,7 +10,7 @@ aho-corasick = "1.1.4"
 directories = "6.0.0"
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
 global-hotkey = "0.8.0"
-ignore = "0.4.33"
+ignore = "0.4.23"
 libc = "0.2.189"
 notify = "8.2.0"
 rayon = "1.12.0"

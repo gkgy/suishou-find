@@ -607,36 +607,48 @@ impl eframe::App for MiaoFindApp {
                 });
                 ui.checkbox(&mut self.include_paths, "同时匹配路径")
                     .on_hover_text("开启后，父目录名称也参与匹配，例如用项目名查找项目内文件");
-                egui::ComboBox::from_id_salt("sort_mode")
-                    .selected_text(self.sort_order.label())
-                    .show_ui(ui, |ui| {
-                        for order in [
-                            SortOrder::Relevance,
-                            SortOrder::Latest,
-                            SortOrder::Oldest,
-                            SortOrder::Name,
-                        ] {
-                            ui.add_enabled_ui(
-                                !matches!(order, SortOrder::Latest | SortOrder::Oldest)
-                                    || self.index.dates_ready(),
-                                |ui| {
-                                    ui.selectable_value(&mut self.sort_order, order, order.label());
-                                },
-                            );
-                        }
-                    });
                 ui.label("⌥ Space 唤起 · 双击打开");
             });
-            let response = ui.add_sized(
-                [ui.available_width(), 30.0],
-                egui::TextEdit::singleline(&mut self.query)
-                    .hint_text(if self.include_paths {
-                        "搜索名称和路径，空格组合关键词"
-                    } else {
-                        "搜索文件或文件夹名称，空格组合关键词"
+            let response = ui
+                .horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("sort_mode")
+                            .width(140.0)
+                            .selected_text(self.sort_order.label())
+                            .show_ui(ui, |ui| {
+                                for order in [
+                                    SortOrder::Relevance,
+                                    SortOrder::Latest,
+                                    SortOrder::Oldest,
+                                    SortOrder::Name,
+                                ] {
+                                    ui.add_enabled_ui(
+                                        !matches!(order, SortOrder::Latest | SortOrder::Oldest)
+                                            || self.index.dates_ready(),
+                                        |ui| {
+                                            ui.selectable_value(
+                                                &mut self.sort_order,
+                                                order,
+                                                order.label(),
+                                            );
+                                        },
+                                    );
+                                }
+                            });
+                        ui.add_sized(
+                            [ui.available_width(), 30.0],
+                            egui::TextEdit::singleline(&mut self.query)
+                                .hint_text(if self.include_paths {
+                                    "搜索名称和路径，空格组合关键词"
+                                } else {
+                                    "搜索文件或文件夹名称，空格组合关键词"
+                                })
+                                .font(egui::FontId::proportional(16.0)),
+                        )
                     })
-                    .font(egui::FontId::proportional(16.0)),
-            );
+                    .inner
+                })
+                .inner;
             if context.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if self.query.is_empty() {
                     context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
