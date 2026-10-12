@@ -367,6 +367,7 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SortOrder {
     #[default]
+    Relevance,
     Latest,
     Oldest,
     Name,
@@ -374,6 +375,7 @@ pub enum SortOrder {
 impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Relevance => "相关性优先",
             Self::Latest => "最新修改优先",
             Self::Oldest => "最早修改优先",
             Self::Name => "名称升序",
@@ -398,13 +400,68 @@ pub fn search_sorted_with_scope(
     order: SortOrder,
     include_paths: bool,
 ) -> Vec<usize> {
-    if order != SortOrder::Name && !index.dates_ready {
+    if matches!(order, SortOrder::Latest | SortOrder::Oldest) && !index.dates_ready {
         return search_filtered_with_scope(index, query, limit, category, include_paths);
     }
     if limit == 0 {
         return Vec::new();
     }
     let mut results = search_filtered_with_scope(index, query, usize::MAX, category, include_paths);
+    if order == SortOrder::Relevance {
+        let query: Vec<u8> = query
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .map(|b| b.to_ascii_lowercase())
+            .collect();
+        // Cache ranking once per hit; comparisons never rebuild full paths.
+        let mut ranked: Vec<_> = results
+            .into_iter()
+            .map(|id| {
+                let name = index.name(id);
+                let stem = name.strip_suffix(".app").unwrap_or(name);
+                let normalized = || {
+                    stem.bytes()
+                        .filter(|b| !b.is_ascii_whitespace())
+                        .map(|b| b.to_ascii_lowercase())
+                };
+                let quality = if normalized().eq(query.iter().copied()) {
+                    0
+                } else if normalized().take(query.len()).eq(query.iter().copied()) {
+                    1
+                } else {
+                    2
+                };
+                let app_tier = if category == Category::Application && name.ends_with(".app") {
+                    let path = index.path(id);
+                    if path.contains(".app/") {
+                        3
+                    } else if path.starts_with("/private/var/") || path.starts_with("/tmp/") {
+                        4
+                    } else if path.starts_with("/Applications/") || path.contains("/Applications/")
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                };
+                (id, app_tier, quality)
+            })
+            .collect();
+        let compare = |a: &(usize, u8, u8), b: &(usize, u8, u8)| {
+            (a.1, a.2)
+                .cmp(&(b.1, b.2))
+                .then_with(|| index.name(a.0).cmp(index.name(b.0)))
+                .then_with(|| a.0.cmp(&b.0))
+        };
+        if ranked.len() > limit {
+            ranked.select_nth_unstable_by(limit, compare);
+            ranked.truncate(limit);
+        }
+        ranked.sort_unstable_by(compare);
+        return ranked.into_iter().map(|r| r.0).collect();
+    }
     let compare = |a: &usize, b: &usize| {
         if order == SortOrder::Name {
             return index.name(*a).cmp(index.name(*b)).then_with(|| a.cmp(b));
@@ -1243,6 +1300,83 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+    #[test]
+    fn relevant_main_apps_precede_helpers_but_manual_dates_stay_global() {
+        use super::{Category, SortOrder, search_sorted_with_scope};
+        let mut flat: Vec<_> = [
+            "/",
+            "/Applications",
+            "/Applications/Google Chrome.app/Contents",
+            "/private",
+            "/private/var",
+            "/private/var/folders",
+            "/private/var/folders/cache",
+            "/tmp",
+        ]
+        .into_iter()
+        .map(|path| FlatEntry {
+            path: path.into(),
+            is_dir: true,
+            modified: 0,
+        })
+        .collect();
+        flat.extend(vec![
+            FlatEntry {
+                path: "/Applications/Google Chrome.app".into(),
+                is_dir: true,
+                modified: 100,
+            },
+            FlatEntry {
+                path: "/Applications/Google Chrome.app/Contents/Google Chrome Helper.app".into(),
+                is_dir: true,
+                modified: 900,
+            },
+            FlatEntry {
+                path: "/private/var/folders/cache/Google Chrome.app".into(),
+                is_dir: true,
+                modified: 1000,
+            },
+            FlatEntry {
+                path: "/Applications/WorkBuddy.app".into(),
+                is_dir: true,
+                modified: 200,
+            },
+            FlatEntry {
+                path: "/tmp/WorkBuddy Helper.app".into(),
+                is_dir: true,
+                modified: 2000,
+            },
+        ]);
+        let index = CompactIndex::from_flat(vec!["/".into()], flat).unwrap();
+        let run = |q, order| {
+            search_sorted_with_scope(&index, q, 500, Category::Application, order, false)
+        };
+        assert_eq!(
+            index.path(run("chrome", SortOrder::Relevance)[0]),
+            "/Applications/Google Chrome.app"
+        );
+        assert_eq!(
+            index.path(run("work buddy", SortOrder::Relevance)[0]),
+            "/Applications/WorkBuddy.app"
+        );
+        assert_eq!(
+            index.modified(run("chrome", SortOrder::Latest)[0]),
+            Some(1000)
+        );
+        assert_eq!(
+            index.modified(run("chrome", SortOrder::Oldest)[0]),
+            Some(100)
+        );
+        let limited = search_sorted_with_scope(
+            &index,
+            "chrome",
+            1,
+            Category::Application,
+            SortOrder::Relevance,
+            false,
+        );
+        assert_eq!(index.path(limited[0]), "/Applications/Google Chrome.app");
     }
     #[test]
     fn name_scope_excludes_parent_only_matches_with_sort_and_category() {

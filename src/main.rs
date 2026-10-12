@@ -88,8 +88,8 @@ impl MiaoFindApp {
                     last_category: Category::All,
                     include_paths: false,
                     last_include_paths: false,
-                    sort_order: SortOrder::Latest,
-                    last_sort_order: SortOrder::Latest,
+                    sort_order: SortOrder::Relevance,
+                    last_sort_order: SortOrder::Relevance,
                     date_receiver: None,
                     status: if count == 0 {
                         "请选择一个文件夹建立索引".to_owned()
@@ -122,8 +122,8 @@ impl MiaoFindApp {
                 last_category: Category::All,
                 include_paths: false,
                 last_include_paths: false,
-                sort_order: SortOrder::Latest,
-                last_sort_order: SortOrder::Latest,
+                sort_order: SortOrder::Relevance,
+                last_sort_order: SortOrder::Relevance,
                 date_receiver: None,
                 status: format!("索引初始化失败：{error}"),
                 scanning: false,
@@ -607,6 +607,24 @@ impl eframe::App for MiaoFindApp {
                 });
                 ui.checkbox(&mut self.include_paths, "同时匹配路径")
                     .on_hover_text("开启后，父目录名称也参与匹配，例如用项目名查找项目内文件");
+                egui::ComboBox::from_id_salt("sort_mode")
+                    .selected_text(self.sort_order.label())
+                    .show_ui(ui, |ui| {
+                        for order in [
+                            SortOrder::Relevance,
+                            SortOrder::Latest,
+                            SortOrder::Oldest,
+                            SortOrder::Name,
+                        ] {
+                            ui.add_enabled_ui(
+                                !matches!(order, SortOrder::Latest | SortOrder::Oldest)
+                                    || self.index.dates_ready(),
+                                |ui| {
+                                    ui.selectable_value(&mut self.sort_order, order, order.label());
+                                },
+                            );
+                        }
+                    });
                 ui.label("⌥ Space 唤起 · 双击打开");
             });
             let response = ui.add_sized(
@@ -698,7 +716,7 @@ impl eframe::App for MiaoFindApp {
                     let label = match self.sort_order {
                         SortOrder::Latest => "修改日期 ↓",
                         SortOrder::Oldest => "修改日期 ↑",
-                        SortOrder::Name => "修改日期",
+                        SortOrder::Name | SortOrder::Relevance => "修改日期",
                     };
                     if ui
                         .add_enabled(

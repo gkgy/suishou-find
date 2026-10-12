@@ -27,7 +27,12 @@ fn main() {
         "photo png",
     ] {
         for paths in [false, true] {
-            for order in [SortOrder::Latest, SortOrder::Oldest, SortOrder::Name] {
+            for order in [
+                SortOrder::Relevance,
+                SortOrder::Latest,
+                SortOrder::Oldest,
+                SortOrder::Name,
+            ] {
                 let run = || {
                     index::search_sorted_with_scope(&index, query, 500, Category::All, order, paths)
                 };
