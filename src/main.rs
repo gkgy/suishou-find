@@ -16,8 +16,7 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     hotkey::{Code, HotKey, Modifiers},
 };
-use miao_find::index::{self, Category, CompactIndex, IndexDelta, ScanMessage};
-use notify::event::ModifyKind;
+use miao_find::index::{self, Category, CompactIndex, IndexDelta, ScanMessage, SortOrder};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 fn main() -> eframe::Result {
@@ -45,6 +44,9 @@ struct MiaoFindApp {
     last_query: String,
     category: Category,
     last_category: Category,
+    sort_order: SortOrder,
+    last_sort_order: SortOrder,
+    date_receiver: Option<Receiver<Vec<(u64, i64, i64)>>>,
     status: String,
     scanning: bool,
     scan_receiver: Option<Receiver<ScanMessage>>,
@@ -63,7 +65,7 @@ struct MiaoFindApp {
 
 impl MiaoFindApp {
     fn new(context: &eframe::CreationContext<'_>) -> Self {
-        context.egui_ctx.set_visuals(egui::Visuals::dark());
+        context.egui_ctx.set_visuals(egui::Visuals::light());
         install_chinese_font(&context.egui_ctx);
         index::warm_up_parallel_search();
         let hotkey_requested = Arc::new(AtomicBool::new(false));
@@ -82,6 +84,9 @@ impl MiaoFindApp {
                     last_query: String::new(),
                     category: Category::All,
                     last_category: Category::All,
+                    sort_order: SortOrder::Latest,
+                    last_sort_order: SortOrder::Latest,
+                    date_receiver: None,
                     status: if count == 0 {
                         "请选择一个文件夹建立索引".to_owned()
                     } else {
@@ -111,6 +116,9 @@ impl MiaoFindApp {
                 last_query: String::new(),
                 category: Category::All,
                 last_category: Category::All,
+                sort_order: SortOrder::Latest,
+                last_sort_order: SortOrder::Latest,
+                date_receiver: None,
                 status: format!("索引初始化失败：{error}"),
                 scanning: false,
                 scan_receiver: None,
@@ -131,7 +139,47 @@ impl MiaoFindApp {
             app.status = error;
         }
         app.start_watcher();
+        app.start_dates();
         app
+    }
+
+    fn start_dates(&mut self) {
+        if self.index.is_empty() {
+            return;
+        }
+        let snapshot = self.index.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.date_receiver = Some(receiver);
+        let context = self.app_context.clone();
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build();
+            let dates = match pool {
+                Ok(pool) => pool.install(|| snapshot.collect_dates()),
+                Err(_) => snapshot.collect_dates(),
+            };
+            let _ = sender.send(dates);
+            context.request_repaint();
+        });
+    }
+    fn receive_dates(&mut self, context: &egui::Context) {
+        if let Some(receiver) = self.date_receiver.take() {
+            match receiver.try_recv() {
+                Ok(dates) => {
+                    self.index.apply_dates(dates);
+                    if let Err(error) = self.index.save_dates() {
+                        self.status = format!("日期缓存保存失败：{error}");
+                    }
+                    self.last_query.clear();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.date_receiver = Some(receiver);
+                    context.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.status = "修改日期补充失败，请重新打开重试".into()
+                }
+            }
+        }
     }
 
     fn choose_roots(&mut self, replace: bool) {
@@ -184,6 +232,7 @@ impl MiaoFindApp {
                 ScanMessage::Finished { index, elapsed_ms } => {
                     self.roots = index.roots().to_vec();
                     self.index = index;
+                    self.date_receiver = None;
                     self.pending_paths.clear();
                     self.update_receiver = None;
                     self.scanning = false;
@@ -313,15 +362,30 @@ impl MiaoFindApp {
     }
 
     fn update_search(&mut self) {
-        if self.query == self.last_query && self.category == self.last_category {
+        if self.query == self.last_query
+            && self.category == self.last_category
+            && self.sort_order == self.last_sort_order
+        {
             return;
         }
         let started = Instant::now();
-        self.results = index::search_filtered(&self.index, &self.query, 500, self.category);
-        self.selected_result = self.results.first().copied();
+        self.results = index::search_sorted(
+            &self.index,
+            &self.query,
+            500,
+            self.category,
+            self.sort_order,
+        );
+        if !self
+            .selected_result
+            .is_some_and(|id| self.results.contains(&id))
+        {
+            self.selected_result = self.results.first().copied();
+        }
         self.query_ms = started.elapsed().as_secs_f64() * 1_000.0;
         self.last_query.clone_from(&self.query);
         self.last_category = self.category;
+        self.last_sort_order = self.sort_order;
     }
 
     fn move_selection(&mut self, direction: isize) {
@@ -355,6 +419,27 @@ impl MiaoFindApp {
     }
 }
 
+fn format_modified(value: Option<i64>) -> String {
+    let Some(value) = value else {
+        return "暂无日期".into();
+    };
+    let seconds = value.div_euclid(1000) as libc::time_t;
+    // localtime_r uses the computer's local timezone and writes into owned storage.
+    let mut result: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&seconds, &mut result) }.is_null() {
+        return "暂无日期".into();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        result.tm_year + 1900,
+        result.tm_mon + 1,
+        result.tm_mday,
+        result.tm_hour,
+        result.tm_min,
+        result.tm_sec
+    )
+}
+
 fn install_global_hotkey(
     context: &egui::Context,
     requested: Arc<AtomicBool>,
@@ -381,9 +466,7 @@ fn install_global_hotkey(
 fn is_index_relevant(kind: &notify::EventKind) -> bool {
     matches!(
         kind,
-        notify::EventKind::Create(_)
-            | notify::EventKind::Remove(_)
-            | notify::EventKind::Modify(ModifyKind::Name(_))
+        notify::EventKind::Create(_) | notify::EventKind::Remove(_) | notify::EventKind::Modify(_)
     )
 }
 
@@ -457,14 +540,6 @@ fn install_chinese_font(context: &egui::Context) {
     context.set_fonts(fonts);
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke_test() {
-        assert_eq!(2 + 2, 4);
-    }
-}
-
 impl eframe::App for MiaoFindApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.index.persist();
@@ -485,48 +560,44 @@ impl eframe::App for MiaoFindApp {
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root_ui.ctx().clone();
+        context.set_visuals(egui::Visuals::light());
         self.receive_scan_updates(&context);
         self.receive_file_updates(&context);
-
-        egui::CentralPanel::default().show(root_ui, |ui| {
-            ui.add_space(12.0);
+        self.receive_dates(&context);
+        egui::Panel::top("search_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("随手找").size(25.0));
-                ui.add_space(10.0);
-                ui.label(RichText::new("⌥ Space · 文件名与路径").color(Color32::GRAY));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(!self.scanning, |ui| {
-                        ui.menu_button("索引", |ui| {
-                            if ui.button("全盘索引").clicked() {
-                                self.start_scan(index::full_disk_roots());
+                ui.label(RichText::new("随手找").strong());
+                ui.add_enabled_ui(!self.scanning, |ui| {
+                    ui.menu_button("索引", |ui| {
+                        if ui.button("全盘索引").clicked() {
+                            self.start_scan(index::full_disk_roots());
+                            ui.close();
+                        }
+                        if ui.button("选择位置…").clicked() {
+                            self.choose_roots(true);
+                            ui.close();
+                        }
+                        if !self.roots.is_empty() {
+                            if ui.button("添加位置…").clicked() {
+                                self.choose_roots(false);
                                 ui.close();
                             }
-                            if ui.button("选择一个或多个位置…").clicked() {
-                                self.choose_roots(true);
+                            if ui.button("重新建立索引").clicked() {
+                                self.start_scan(self.roots.clone());
                                 ui.close();
                             }
-                            if !self.roots.is_empty() {
-                                if ui.button("添加位置…").clicked() {
-                                    self.choose_roots(false);
-                                    ui.close();
-                                }
-                                if ui.button("重新建立索引").clicked() {
-                                    self.start_scan(self.roots.clone());
-                                    ui.close();
-                                }
-                            }
-                        });
+                        }
                     });
                 });
+                ui.label("⌥ Space 唤起 · 双击打开 · 右键更多操作");
             });
-            ui.add_space(8.0);
             let response = ui.add_sized(
-                [ui.available_width(), 42.0],
+                [ui.available_width(), 30.0],
                 egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("输入文件名、扩展名或路径，可用空格组合关键词")
-                    .font(egui::TextStyle::Heading),
+                    .hint_text("搜索文件名或路径，空格组合关键词")
+                    .font(egui::FontId::proportional(16.0)),
             );
-            if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            if context.input(|i| i.key_pressed(egui::Key::Escape)) {
                 if self.query.is_empty() {
                     context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 } else {
@@ -538,107 +609,183 @@ impl eframe::App for MiaoFindApp {
                 response.request_focus();
                 self.focus_search = false;
             }
-            ui.horizontal_wrapped(|ui| {
-                for kind in Category::ALL {
-                    ui.selectable_value(&mut self.category, kind, kind.label());
+        });
+        egui::Panel::bottom("status_bar").show(root_ui, |ui| {
+            ui.horizontal(|ui| {
+                if self.scanning || self.date_receiver.is_some() {
+                    ui.spinner();
                 }
-            });
-            self.update_search();
-            if context.input(|input| input.key_pressed(egui::Key::ArrowDown)) {
-                self.move_selection(1);
-            }
-            if context.input(|input| input.key_pressed(egui::Key::ArrowUp)) {
-                self.move_selection(-1);
-            }
-            if context.input(|input| input.key_pressed(egui::Key::Enter)) {
-                if let Some(selected) = self.selected_result {
-                    if let Err(error) = Self::open(&self.index.path(selected)) {
-                        self.status = error;
-                    }
+                if self.date_receiver.is_some() {
+                    ui.label("正在核对修改日期");
+                } else {
+                    ui.label(&self.status);
                 }
-            }
-
-            ui.add_space(8.0);
-            ui.separator();
-
-            if self.index.is_empty() && !self.scanning {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("建立第一个文件名索引");
-                    ui.label(
-                        "可一次选择多个位置，或直接建立全盘索引；受保护目录需要完全磁盘访问权限。",
-                    );
-                    ui.add_space(14.0);
-                    if ui.button("选择一个或多个位置").clicked() {
-                        self.choose_roots(true);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!(
+                        "{} 个结果 · {:.2} ms",
+                        self.results.len(),
+                        self.query_ms
+                    ));
+                    if self.results.len() == 500 {
+                        ui.label("显示前 500 项");
                     }
                 });
-            } else {
-                let result_height = (ui.available_height() - 38.0).max(80.0);
+            });
+        });
+        egui::Panel::left("categories")
+            .default_size(135.0)
+            .min_size(110.0)
+            .max_size(220.0)
+            .show(root_ui, |ui| {
+                ui.label(RichText::new("分类").strong());
+                ui.separator();
+                for kind in Category::ALL {
+                    ui.add_sized(
+                        [ui.available_width(), 27.0],
+                        egui::Button::new("")
+                            .left_text(kind.label())
+                            .frame_when_inactive(false)
+                            .selected(self.category == kind),
+                    )
+                    .clicked()
+                    .then(|| self.category = kind);
+                }
+            });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(4))
+            .show(root_ui, |ui| {
+                let width = ui.available_width();
+                let date_width = 175.0;
+                let name_width = (width * 0.30).clamp(155.0, 350.0);
+                let path_width = (width - name_width - date_width - 16.0).max(80.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [name_width, 27.0],
+                            egui::Button::new(if self.sort_order == SortOrder::Name {
+                                "名称 ↑"
+                            } else {
+                                "名称"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.sort_order = SortOrder::Name;
+                    }
+                    ui.add_sized([path_width, 27.0], egui::Label::new("所在路径"));
+                    let label = match self.sort_order {
+                        SortOrder::Latest => "修改日期 ↓",
+                        SortOrder::Oldest => "修改日期 ↑",
+                        SortOrder::Name => "修改日期",
+                    };
+                    if ui
+                        .add_enabled(
+                            self.index.dates_ready(),
+                            egui::Button::new(label).min_size(egui::vec2(date_width, 27.0)),
+                        )
+                        .clicked()
+                    {
+                        self.sort_order = if self.sort_order == SortOrder::Latest {
+                            SortOrder::Oldest
+                        } else {
+                            SortOrder::Latest
+                        };
+                    }
+                });
+                self.update_search();
+                if context.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    self.move_selection(1);
+                }
+                if context.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    self.move_selection(-1);
+                }
+                if context.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(id) = self.selected_result {
+                        if let Err(e) = Self::open(&self.index.path(id)) {
+                            self.status = e;
+                        }
+                    }
+                }
+                ui.separator();
+                if self.index.is_empty() && !self.scanning {
+                    ui.label("请选择位置建立文件名索引");
+                    if ui.button("选择位置…").clicked() {
+                        self.choose_roots(true);
+                    }
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .max_height(result_height)
-                    .show_rows(ui, 42.0, self.results.len(), |ui, range| {
-                        for &entry_index in &self.results[range] {
-                            let path = self.index.path(entry_index);
-                            let name = self.index.name(entry_index).to_owned();
-                            let category = self.index.category(entry_index);
-                            let icon = category.icon();
-                            let selected = self.selected_result == Some(entry_index);
-                            let frame = egui::Frame::new()
-                                .fill(if selected {
-                                    ui.visuals().selection.bg_fill
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .inner_margin(egui::Margin::symmetric(5, 2))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let icon_response = ui.add(
-                                            egui::Label::new(icon).sense(egui::Sense::click()),
-                                        );
-                                        let text_response = ui
-                                            .vertical(|ui| {
-                                                let name_response = ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(format!(
-                                                            "{}   · {}",
-                                                            name,
-                                                            category.label()
-                                                        ))
-                                                        .strong(),
-                                                    )
-                                                    .sense(egui::Sense::click()),
-                                                );
-                                                let path_response = ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&path)
-                                                            .small()
-                                                            .color(Color32::GRAY),
-                                                    )
-                                                    .sense(egui::Sense::click()),
-                                                );
-                                                name_response.union(path_response)
-                                            })
-                                            .inner;
-                                        icon_response.union(text_response)
-                                    })
-                                    .inner
-                                });
-                            let response = frame
-                                .response
-                                .interact(egui::Sense::click())
-                                .union(frame.inner);
+                    .show_rows(ui, 27.0, self.results.len(), |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for row in range {
+                            let id = self.results[row];
+                            let path = self.index.path(id);
+                            let parent = std::path::Path::new(&path)
+                                .parent()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let name = format!(
+                                "{}  {}",
+                                self.index.category(id).icon(),
+                                self.index.name(id)
+                            );
+                            let date = format_modified(self.index.modified(id));
+                            let selected = self.selected_result == Some(id);
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 27.0),
+                                egui::Sense::click(),
+                            );
+                            let bg = if selected {
+                                Color32::from_rgb(25, 85, 170)
+                            } else if response.hovered() {
+                                Color32::from_rgb(232, 240, 250)
+                            } else {
+                                Color32::WHITE
+                            };
+                            ui.painter().rect_filled(rect, 0.0, bg);
+                            let color = if selected {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(20, 20, 20)
+                            };
+                            let mut cell = |offset: f32, cell_width: f32, text: &str| {
+                                let clip = egui::Rect::from_min_size(
+                                    rect.min + egui::vec2(offset + 4.0, 0.0),
+                                    egui::vec2(cell_width - 8.0, 27.0),
+                                );
+                                ui.scope_builder(
+                                    egui::UiBuilder::new()
+                                        .max_rect(clip)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(text).size(14.0).color(color),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                    },
+                                )
+                                .inner
+                            };
+                            let response = response
+                                .union(cell(0.0, name_width, &name))
+                                .union(cell(name_width + 8.0, path_width, &parent))
+                                .union(cell(name_width + path_width + 16.0, date_width, &date));
+                            let response = response.on_hover_text(&path);
                             if response.clicked() {
-                                self.selected_result = Some(entry_index);
-                                if let Err(error) = Self::open(&path) {
-                                    self.status = error;
+                                self.selected_result = Some(id);
+                            }
+                            if response.double_clicked() {
+                                if let Err(e) = Self::open(&path) {
+                                    self.status = e;
                                 }
                             }
                             response.context_menu(|ui| {
                                 if ui.button("打开").clicked() {
-                                    if let Err(error) = Self::open(&path) {
-                                        self.status = error;
+                                    if let Err(e) = Self::open(&path) {
+                                        self.status = e;
                                     }
                                     ui.close();
                                 }
@@ -651,37 +798,31 @@ impl eframe::App for MiaoFindApp {
                                     ui.close();
                                 }
                             });
-                            ui.separator();
                         }
                     });
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if self.scanning {
-                    ui.spinner();
-                }
-                ui.label(&self.status);
-                if !self.roots.is_empty() {
-                    ui.label(
-                        RichText::new(format!("· {} 个索引位置 · ⌥ Space", self.roots.len()))
-                            .color(Color32::GRAY),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if !self.query.is_empty() {
-                        ui.label(format!(
-                            "{} 个结果 · {:.2} ms",
-                            self.results.len(),
-                            self.query_ms
-                        ));
-                    }
-                });
             });
-        });
-
         if self.scanning {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn content_and_metadata_modifications_refresh_dates() {
+        use notify::{
+            EventKind,
+            event::{AccessKind, DataChange, MetadataKind, ModifyKind},
+        };
+        assert!(super::is_index_relevant(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(super::is_index_relevant(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+        assert!(!super::is_index_relevant(&EventKind::Access(
+            AccessKind::Read
+        )));
     }
 }

@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         mpsc::Sender,
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aho_corasick::AhoCorasickBuilder;
@@ -18,6 +18,8 @@ use ignore::{WalkBuilder, WalkState};
 use rayon::prelude::*;
 use rusqlite::Connection;
 
+const UNKNOWN_DATE: i64 = i64::MIN;
+const DATE_MAGIC: &[u8; 8] = b"MIAODATE";
 const MAGIC: &[u8; 8] = b"MIAOIDX3";
 const NO_PARENT: u32 = u32::MAX;
 const ALIVE: u8 = 1;
@@ -29,21 +31,24 @@ struct Record {
     name_start: u32,
     name_len: u16,
     flags: u8,
+    modified: i64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CompactIndex {
     records: Vec<Record>,
     names: Vec<u8>,
     path_hashes: Vec<u64>,
     roots: Vec<PathBuf>,
     active_count: usize,
+    dates_ready: bool,
 }
 
 #[derive(Clone, Debug)]
 struct FlatEntry {
     path: Box<str>,
     is_dir: bool,
+    modified: i64,
 }
 
 impl CompactIndex {
@@ -101,6 +106,7 @@ impl CompactIndex {
             path_hashes: Vec::with_capacity(flat.len()),
             roots: normalize_roots(roots),
             active_count: 0,
+            dates_ready: true,
         };
         index.append_flat(flat)?;
         Ok(index)
@@ -159,6 +165,7 @@ impl CompactIndex {
                 name_start: self.names.len() as u32,
                 name_len: name.len() as u16,
                 flags,
+                modified: entry.modified,
             });
             self.names.extend_from_slice(name.as_bytes());
             let hash = hash_path(path);
@@ -217,6 +224,7 @@ impl CompactIndex {
                     name_start: names.len() as u32,
                     name_len: old.name_len,
                     flags: old.flags,
+                    modified: old.modified,
                 });
                 names.extend_from_slice(&self.names[start..end]);
                 path_hashes.push(self.path_hashes[old_id]);
@@ -250,6 +258,166 @@ impl IndexDelta {
     pub fn changed(&self) -> usize {
         self.changed
     }
+}
+
+fn timestamp_ms(value: SystemTime) -> i64 {
+    match value.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis().min(i64::MAX as u128) as i64,
+        Err(e) => -(e.duration().as_millis().min(i64::MAX as u128) as i64),
+    }
+}
+impl CompactIndex {
+    pub fn modified(&self, id: usize) -> Option<i64> {
+        (self.records[id].modified != UNKNOWN_DATE).then_some(self.records[id].modified)
+    }
+    pub fn dates_ready(&self) -> bool {
+        self.dates_ready
+    }
+    pub fn collect_dates(&self) -> Vec<(u64, i64, i64)> {
+        self.records
+            .par_iter()
+            .enumerate()
+            .filter(|(_id, r)| r.flags & ALIVE != 0)
+            .map(|(id, _)| {
+                let date = fs::symlink_metadata(self.path(id))
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(timestamp_ms)
+                    .unwrap_or(UNKNOWN_DATE);
+                (self.path_hashes[id], self.records[id].modified, date)
+            })
+            .collect()
+    }
+    pub fn apply_dates(&mut self, values: Vec<(u64, i64, i64)>) {
+        let dates: HashMap<_, _> = values
+            .into_iter()
+            .map(|(hash, before, after)| (hash, (before, after)))
+            .collect();
+        for (hash, record) in self.path_hashes.iter().zip(&mut self.records) {
+            // Preserve newer metadata obtained by a concurrent file change.
+            if let Some(&(before, after)) = dates.get(hash) {
+                if record.modified == before {
+                    record.modified = after;
+                }
+            }
+        }
+        self.dates_ready = true;
+    }
+    pub fn save_dates(&self) -> Result<(), String> {
+        if !self.dates_ready {
+            return Ok(());
+        }
+        save_dates_to(self, &data_dir()?.join("modified-v1.bin"))
+    }
+}
+fn save_dates_to(index: &CompactIndex, path: &Path) -> Result<(), String> {
+    let temporary = path.with_extension("tmp");
+    let mut writer = BufWriter::with_capacity(
+        1024 * 1024,
+        File::create(&temporary).map_err(|e| e.to_string())?,
+    );
+    writer.write_all(DATE_MAGIC).map_err(|e| e.to_string())?;
+    write_u64(&mut writer, index.active_count as u64)?;
+    for (hash, record) in index.path_hashes.iter().zip(&index.records) {
+        if record.flags & ALIVE == 0 {
+            continue;
+        }
+        write_u64(&mut writer, *hash)?;
+        writer
+            .write_all(&record.modified.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    fs::rename(temporary, path).map_err(|e| e.to_string())
+}
+fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
+    let mut reader =
+        BufReader::with_capacity(1024 * 1024, File::open(path).map_err(|e| e.to_string())?);
+    let mut magic = [0; 8];
+    reader.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != DATE_MAGIC {
+        return Err("日期缓存格式错误".into());
+    }
+    let count = read_u64(&mut reader)?;
+    if count > u32::MAX as u64
+        || fs::metadata(path).map_err(|e| e.to_string())?.len() != 16 + count * 16
+    {
+        return Err("日期缓存损坏".into());
+    }
+    let mut dates = HashMap::with_capacity(count as usize);
+    for _ in 0..count {
+        let hash = read_u64(&mut reader)?;
+        let date = read_u64(&mut reader)? as i64;
+        dates.insert(hash, date);
+    }
+    index.dates_ready = index
+        .path_hashes
+        .iter()
+        .zip(&index.records)
+        .filter(|(_, r)| r.flags & ALIVE != 0)
+        .all(|(hash, _)| dates.contains_key(hash));
+    for (hash, record) in index.path_hashes.iter().zip(&mut index.records) {
+        if let Some(&date) = dates.get(hash) {
+            record.modified = date;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    #[default]
+    Latest,
+    Oldest,
+    Name,
+}
+impl SortOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Latest => "最新修改优先",
+            Self::Oldest => "最早修改优先",
+            Self::Name => "名称升序",
+        }
+    }
+}
+pub fn search_sorted(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    order: SortOrder,
+) -> Vec<usize> {
+    if order != SortOrder::Name && !index.dates_ready {
+        return search_filtered(index, query, limit, category);
+    }
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut results = search_filtered(index, query, usize::MAX, category);
+    let compare = |a: &usize, b: &usize| {
+        if order == SortOrder::Name {
+            return index.name(*a).cmp(index.name(*b)).then_with(|| a.cmp(b));
+        }
+        match (index.modified(*a), index.modified(*b)) {
+            (Some(a_date), Some(b_date)) => {
+                let cmp = if order == SortOrder::Latest {
+                    b_date.cmp(&a_date)
+                } else {
+                    a_date.cmp(&b_date)
+                };
+                cmp.then_with(|| a.cmp(b))
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.cmp(b),
+        }
+    };
+    if results.len() > limit {
+        results.select_nth_unstable_by(limit, compare);
+        results.truncate(limit);
+    }
+    results.sort_unstable_by(compare);
+    results
 }
 
 pub fn warm_up_parallel_search() {
@@ -327,6 +495,7 @@ pub fn load() -> Result<CompactIndex, String> {
     } else {
         CompactIndex::default()
     };
+    let _ = load_dates(&mut index, &data_dir()?.join("modified-v1.bin"));
     let paths = read_journal()?;
     if !paths.is_empty() {
         index.apply_delta(collect_delta(paths, false)?)?;
@@ -356,6 +525,7 @@ fn migrate_legacy() -> Result<CompactIndex, String> {
             Ok(FlatEntry {
                 path: row.get::<_, String>(0)?.into_boxed_str(),
                 is_dir: row.get::<_, i64>(1)? != 0,
+                modified: UNKNOWN_DATE,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -363,7 +533,8 @@ fn migrate_legacy() -> Result<CompactIndex, String> {
     for row in rows {
         flat.push(row.map_err(|error| error.to_string())?);
     }
-    let index = CompactIndex::from_flat(roots, flat)?;
+    let mut index = CompactIndex::from_flat(roots, flat)?;
+    index.dates_ready = false;
     save_compact(&index)?;
     Ok(index)
 }
@@ -400,6 +571,7 @@ fn save_compact(index: &CompactIndex) -> Result<(), String> {
     writer.flush().map_err(|error| error.to_string())?;
     fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
     File::create(journal_path()?).map_err(|error| error.to_string())?;
+    index.save_dates()?;
     Ok(())
 }
 
@@ -446,6 +618,7 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
             name_start,
             name_len,
             flags: flags[0],
+            modified: UNKNOWN_DATE,
         });
     }
     let mut names = vec![0; names_len];
@@ -477,6 +650,7 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
         path_hashes,
         roots: normalize_roots(roots),
         active_count,
+        dates_ready: false,
     })
 }
 
@@ -550,10 +724,16 @@ pub fn scan(roots: Vec<PathBuf>, sender: Sender<ScanMessage>) {
 
 fn make_flat(path: &Path, known_is_dir: Option<bool>) -> Option<FlatEntry> {
     let value = path.to_str()?.to_owned();
-    let is_dir = known_is_dir.unwrap_or_else(|| path.is_dir());
+    let metadata = fs::symlink_metadata(path).ok();
+    let is_dir = known_is_dir.unwrap_or_else(|| metadata.as_ref().is_some_and(|m| m.is_dir()));
+    let modified = metadata
+        .and_then(|m| m.modified().ok())
+        .map(timestamp_ms)
+        .unwrap_or(UNKNOWN_DATE);
     Some(FlatEntry {
         path: value.into_boxed_str(),
         is_dir,
+        modified,
     })
 }
 
@@ -964,7 +1144,7 @@ fn read_u64(reader: &mut impl Read) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactIndex, FlatEntry, search};
+    use super::{CompactIndex, FlatEntry, UNKNOWN_DATE, search};
     fn sample() -> CompactIndex {
         CompactIndex::from_flat(
             vec!["/tmp".into()],
@@ -972,26 +1152,126 @@ mod tests {
                 FlatEntry {
                     path: "/tmp".into(),
                     is_dir: true,
+                    modified: UNKNOWN_DATE,
                 },
                 FlatEntry {
                     path: "/tmp/冷暖站".into(),
                     is_dir: true,
+                    modified: UNKNOWN_DATE,
                 },
                 FlatEntry {
                     path: "/tmp/冷暖站/SCADA恢复记录.md".into(),
                     is_dir: false,
+                    modified: UNKNOWN_DATE,
                 },
                 FlatEntry {
                     path: "/tmp/图片".into(),
                     is_dir: true,
+                    modified: UNKNOWN_DATE,
                 },
                 FlatEntry {
                     path: "/tmp/图片/photo.png".into(),
                     is_dir: false,
+                    modified: UNKNOWN_DATE,
                 },
             ],
         )
         .unwrap()
+    }
+    fn temp_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "suishou-date-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+    #[test]
+    fn newest_is_selected_before_limit_and_unknown_dates_are_last() {
+        use super::{Category, SortOrder, search_sorted};
+        let mut flat = vec![FlatEntry {
+            path: "/tmp".into(),
+            is_dir: true,
+            modified: UNKNOWN_DATE,
+        }];
+        for n in 0..800 {
+            flat.push(FlatEntry {
+                path: format!("/tmp/report{n:04}.md").into(),
+                is_dir: false,
+                modified: n as i64,
+            });
+        }
+        flat.push(FlatEntry {
+            path: "/tmp/report-unknown.md".into(),
+            is_dir: false,
+            modified: UNKNOWN_DATE,
+        });
+        let index = CompactIndex::from_flat(vec!["/tmp".into()], flat).unwrap();
+        let newest = search_sorted(&index, "report", 500, Category::Document, SortOrder::Latest);
+        assert_eq!(newest.len(), 500);
+        assert_eq!(index.name(newest[0]), "report0799.md");
+        assert_eq!(index.modified(*newest.last().unwrap()), Some(300));
+        let oldest = search_sorted(
+            &index,
+            "report",
+            usize::MAX,
+            Category::Document,
+            SortOrder::Oldest,
+        );
+        assert_eq!(index.name(oldest[0]), "report0000.md");
+        assert_eq!(index.modified(*oldest.last().unwrap()), None);
+        let named = search_sorted(&index, "report", 500, Category::Document, SortOrder::Name);
+        assert!(
+            named
+                .windows(2)
+                .all(|pair| index.name(pair[0]) <= index.name(pair[1]))
+        );
+        assert_eq!(index.name(named[0]), "report-unknown.md");
+        assert!(search_sorted(&index, "report", 0, Category::All, SortOrder::Latest).is_empty());
+    }
+    #[test]
+    fn sidecar_matches_by_path_hash_and_survives_record_reordering() {
+        let dir = temp_dir();
+        let cache = dir.join("dates.bin");
+        let mut index = sample();
+        index.records[2].modified = 123456789;
+        super::save_dates_to(&index, &cache).unwrap();
+        let mut loaded = sample();
+        loaded.records.swap(2, 4);
+        loaded.path_hashes.swap(2, 4);
+        super::load_dates(&mut loaded, &cache).unwrap();
+        assert_eq!(loaded.modified(4), Some(123456789));
+        assert!(loaded.dates_ready());
+        std::fs::write(&cache, b"broken").unwrap();
+        assert!(super::load_dates(&mut loaded, &cache).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn filesystem_modified_time_and_concurrent_updates_are_preserved() {
+        let dir = temp_dir();
+        let file = dir.join("test.md");
+        let handle = std::fs::File::create(&file).unwrap();
+        handle
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456)),
+            )
+            .unwrap();
+        let entry = super::make_flat(&file, Some(false)).unwrap();
+        assert_eq!(entry.modified, 123456000);
+        let mut index = sample();
+        let hash = index.path_hashes[2];
+        index.records[2].modified = 200;
+        index.apply_dates(vec![(hash, UNKNOWN_DATE, 100)]);
+        assert_eq!(index.modified(2), Some(200));
+        index.records[2].modified = UNKNOWN_DATE;
+        index.apply_dates(vec![(hash, UNKNOWN_DATE, 100)]);
+        assert_eq!(index.modified(2), Some(100));
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn classifies_metadata_and_app_bundles() {
@@ -1012,16 +1292,19 @@ mod tests {
         let mut flat = vec![FlatEntry {
             path: "/tmp".into(),
             is_dir: true,
+            modified: UNKNOWN_DATE,
         }];
         for n in 0..60_000 {
             flat.push(FlatEntry {
                 path: format!("/tmp/common{n:05}.txt").into(),
                 is_dir: false,
+                modified: UNKNOWN_DATE,
             });
         }
         flat.push(FlatEntry {
             path: "/tmp/z-common.PNG".into(),
             is_dir: false,
+            modified: UNKNOWN_DATE,
         });
         let mut index = CompactIndex::from_flat(vec!["/tmp".into()], flat).unwrap();
         let found = search_filtered(&index, "common", 1, Category::Image);
