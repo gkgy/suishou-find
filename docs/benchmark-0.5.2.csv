@@ -1,0 +1,22 @@
+query,mode,median_ms,p95_ms,results
+output,baseline,2.856,3.231,500
+output,new-default,2.876,3.124,500
+pdf,baseline,2.852,3.290,500
+pdf,new-default,2.893,3.352,500
+md,baseline,11.853,12.204,500
+md,new-default,11.981,12.377,500
+SCADA,baseline,2.631,3.039,41
+SCADA,new-default,2.681,3.081,41
+冷暖站 md,baseline,2.820,3.190,85
+冷暖站 md,new-default,2.819,3.068,85
+不存在xyz987,baseline,1.758,1.997,0
+不存在xyz987,new-default,1.774,1.988,0
+Cargo.toml,baseline,3.091,3.436,3
+Cargo.toml,new-default,3.088,3.410,3
+photo png,baseline,2.808,2.988,113
+photo png,new-default,2.832,3.076,113
+,personal-images-7days,4.130,4.670,500
+/output,personal-images-7days,9.691,11.032,255
+/output baby,personal-images-7days,9.481,11.220,3
+/article-share,personal-images-7days,8.940,9.634,6
+/output,personal-images-custom-range,9.784,10.125,255

@@ -16,7 +16,7 @@ use miao_find::index::{self, Category, CompactIndex, IndexDelta, ScanMessage, So
 mod filters;
 mod shortcut;
 mod thumbnails;
-use filters::{Preferences, SavedFilter};
+use filters::{Preferences, SavedFilter, TimeRange};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use thumbnails::Thumbnails;
 
@@ -42,7 +42,11 @@ struct MiaoFindApp {
     raster: bool,
     exclusion_text: String,
     personal: bool,
-    recent: bool,
+    time_range: TimeRange,
+    date_editor: bool,
+    date_start: String,
+    date_end: String,
+    date_feedback: String,
     thumbnails_enabled: bool,
     thumbnails: Thumbnails,
     filter_signature: String,
@@ -97,7 +101,11 @@ impl MiaoFindApp {
                     raster: false,
                     exclusion_text: String::new(),
                     personal: false,
-                    recent: false,
+                    time_range: TimeRange::Any,
+                    date_editor: false,
+                    date_start: filters::today(),
+                    date_end: filters::today(),
+                    date_feedback: String::new(),
                     thumbnails_enabled: false,
                     thumbnails: Thumbnails::new(context.egui_ctx.clone()),
                     filter_signature: String::new(),
@@ -146,7 +154,11 @@ impl MiaoFindApp {
                 raster: false,
                 exclusion_text: String::new(),
                 personal: false,
-                recent: false,
+                time_range: TimeRange::Any,
+                date_editor: false,
+                date_start: filters::today(),
+                date_end: filters::today(),
+                date_feedback: String::new(),
                 thumbnails_enabled: false,
                 thumbnails: Thumbnails::new(context.egui_ctx.clone()),
                 filter_signature: String::new(),
@@ -598,12 +610,12 @@ impl MiaoFindApp {
     }
 
     fn apply_filter(&mut self, filter: SavedFilter) {
+        self.time_range = filter.effective_time_range();
         self.query = filter.query;
         self.category = filter.category;
         self.sort_order = filter.order;
         self.include_paths = filter.paths;
         self.personal = filter.personal;
-        self.recent = filter.recent;
         self.thumbnails_enabled = filter.thumbnails;
         self.raster = filter.raster;
         self.filter_signature.clear();
@@ -616,19 +628,21 @@ impl MiaoFindApp {
             order: self.sort_order,
             paths: self.include_paths,
             personal: self.personal,
-            recent: self.recent,
+            recent: false,
+            time_range: self.time_range.clone(),
             thumbnails: self.thumbnails_enabled,
             raster: self.raster,
         }
     }
     fn update_search(&mut self) {
+        let (since, until) = self.time_range.bounds().unwrap_or((Some(0), Some(0)));
         let signature = format!(
-            "{}:{}:{}:{}",
+            "{}:{:?}:{}:{}",
             self.personal,
-            self.recent,
+            self.time_range,
             self.raster,
-            if self.recent {
-                filters::seven_days_ago() / 60_000
+            if self.time_range.relative() {
+                since.unwrap_or_default() / 60_000
             } else {
                 0
             }
@@ -643,7 +657,7 @@ impl MiaoFindApp {
             return;
         }
         let started = Instant::now();
-        self.results = index::search_with_options(
+        self.results = index::search_with_date_range(
             &self.index,
             &self.query,
             500,
@@ -651,7 +665,8 @@ impl MiaoFindApp {
             self.sort_order,
             self.include_paths,
             self.personal.then_some(self.personal_mask.as_slice()),
-            self.recent.then(filters::seven_days_ago),
+            since,
+            until,
             self.raster,
         );
         if !self
@@ -825,10 +840,55 @@ impl eframe::App for MiaoFindApp {
         self.receive_file_updates(&context);
         self.receive_dates(&context);
         self.thumbnails.receive(&context);
-        if self.recent {
+        if self.time_range.relative() {
             context.request_repaint_after(std::time::Duration::from_secs(60));
         }
         self.filter_windows(&context);
+        if self.date_editor {
+            let mut open = true;
+            egui::Window::new("自定义修改日期范围")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(&context, |ui| {
+                    ui.label("输入起止日期（YYYY-MM-DD），包含结束日期当天。");
+                    ui.horizontal(|ui| {
+                        ui.label("开始日期");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.date_start).desired_width(140.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("结束日期");
+                        ui.add(egui::TextEdit::singleline(&mut self.date_end).desired_width(140.0));
+                    });
+                    ui.label("例如 2025-01-01 至 2026-12-31；使用本地时区。");
+                    if !self.date_feedback.is_empty() {
+                        ui.colored_label(Color32::DARK_RED, &self.date_feedback);
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("应用日期范围").clicked() {
+                            let range = TimeRange::Custom {
+                                start: self.date_start.trim().into(),
+                                end: self.date_end.trim().into(),
+                            };
+                            match range.bounds() {
+                                Ok(_) => {
+                                    self.time_range = range;
+                                    self.date_editor = false;
+                                }
+                                Err(error) => self.date_feedback = error,
+                            }
+                        }
+                        if ui.button("取消").clicked() {
+                            self.date_editor = false;
+                        }
+                    });
+                });
+            if !open {
+                self.date_editor = false;
+            }
+        }
         egui::Panel::top("search_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("随手找 v{}", env!("CARGO_PKG_VERSION"))).strong());
@@ -916,8 +976,42 @@ impl eframe::App for MiaoFindApp {
                 }
                 ui.separator();
                 ui.add_enabled_ui(self.index.dates_ready(), |ui| {
-                    ui.checkbox(&mut self.recent, "最近 7 天")
-                        .on_hover_text("按修改日期：过去 7 × 24 小时；不是最近打开时间");
+                    egui::ComboBox::from_id_salt("date_range")
+                        .selected_text(self.time_range.label())
+                        .show_ui(ui, |ui| {
+                            for range in [
+                                TimeRange::Any,
+                                TimeRange::Days3,
+                                TimeRange::Week,
+                                TimeRange::Month,
+                                TimeRange::Year,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.time_range,
+                                    range.clone(),
+                                    range.label(),
+                                );
+                            }
+                            if ui
+                                .selectable_label(
+                                    matches!(self.time_range, TimeRange::Custom { .. }),
+                                    "自定义日期…",
+                                )
+                                .clicked()
+                            {
+                                if let TimeRange::Custom { start, end } = &self.time_range {
+                                    self.date_start = start.clone();
+                                    self.date_end = end.clone();
+                                }
+                                self.date_feedback.clear();
+                                self.date_editor = true;
+                                ui.close();
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "按修改日期；最近一个月为 30 天，最近一年为 365 天；不是最近打开时间",
+                        );
                 });
                 ui.checkbox(&mut self.thumbnails_enabled, "图片缩略图");
                 ui.checkbox(&mut self.raster, "仅可预览图片")
@@ -952,6 +1046,11 @@ impl eframe::App for MiaoFindApp {
                         self.preferences.personal_roots.len()
                     ))
                     .small(),
+                );
+            }
+            if let TimeRange::Custom { start, end } = &self.time_range {
+                ui.label(
+                    RichText::new(format!("修改日期：{start} 至 {end}（包含结束当天）")).small(),
                 );
             }
             if context.input(|i| i.key_pressed(egui::Key::Escape)) {

@@ -495,7 +495,33 @@ pub fn search_with_options(
     since: Option<i64>,
     raster: bool,
 ) -> Vec<usize> {
-    if personal.is_none() && since.is_none() && !raster && !query.contains('/') {
+    search_with_date_range(
+        index,
+        query,
+        limit,
+        category,
+        order,
+        include_paths,
+        personal,
+        since,
+        None,
+        raster,
+    )
+}
+/// End is exclusive; compare cached millisecond timestamps without filesystem I/O.
+pub fn search_with_date_range(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    order: SortOrder,
+    include_paths: bool,
+    personal: Option<&[bool]>,
+    since: Option<i64>,
+    until: Option<i64>,
+    raster: bool,
+) -> Vec<usize> {
+    if personal.is_none() && since.is_none() && until.is_none() && !raster && !query.contains('/') {
         return search_sorted_with_scope(index, query, limit, category, order, include_paths);
     }
     if limit == 0 {
@@ -513,7 +539,7 @@ pub fn search_with_options(
                 (index.is_alive(id)
                     && (category == Category::All || index.category(id) == category)
                     && personal.is_none_or(|m| m.get(id).copied().unwrap_or(false))
-                    && since.is_none_or(|s| index.modified(id).is_some_and(|d| d >= s)))
+                    && date_matches(index.modified(id), since, until))
                 .then_some(id)
             })
             .collect::<Vec<_>>()
@@ -537,9 +563,26 @@ pub fn search_with_options(
     hits.retain(|id| {
         (!raster || (index.category(*id) == Category::Image && previewable_image(index.name(*id))))
             && personal.is_none_or(|m| m.get(*id).copied().unwrap_or(false))
-            && since.is_none_or(|s| index.modified(*id).is_some_and(|d| d >= s))
+            && date_matches(index.modified(*id), since, until)
     });
     sort_hits(index, &name_query, limit, category, order, hits)
+}
+
+fn date_matches(value: Option<i64>, since: Option<i64>, until: Option<i64>) -> bool {
+    if since.is_none() && until.is_none() {
+        return true;
+    }
+    value.is_some_and(|d| since.is_none_or(|s| d >= s) && until.is_none_or(|e| d < e))
+}
+#[cfg(test)]
+#[test]
+fn date_range_boundaries_and_unknown_dates() {
+    assert!(date_matches(Some(1000), Some(1000), Some(2000)));
+    assert!(date_matches(Some(1999), Some(1000), Some(2000)));
+    assert!(!date_matches(Some(2000), Some(1000), Some(2000)));
+    assert!(!date_matches(Some(999), Some(1000), Some(2000)));
+    assert!(!date_matches(None, Some(1000), Some(2000)));
+    assert!(date_matches(None, None, None));
 }
 
 fn sort_hits(
@@ -1800,6 +1843,22 @@ mod personal_tests {
                 Some(800),
             )
         };
+        for query in ["", "/output", "png /output"] {
+            let hits = search_with_date_range(
+                &index,
+                query,
+                1,
+                Category::Image,
+                SortOrder::Latest,
+                false,
+                Some(&mask),
+                Some(800),
+                Some(900),
+                true,
+            );
+            assert_eq!(hits.len(), 1);
+            assert_eq!(index.name(hits[0]), "baby.png");
+        }
         assert_eq!(index.name(run("/output", 1)[0]), "recent.png");
         assert_eq!(run("/output", 500).len(), 4);
         assert_eq!(index.name(run("baby /output", 500)[0]), "baby.png");

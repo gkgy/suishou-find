@@ -134,4 +134,35 @@ fn main() {
             times[10], times[19]
         );
     }
+    let until = since + 7 * 86_400_000;
+    let mut times = Vec::new();
+    let mut count = 0;
+    for round in 0..24 {
+        let t = Instant::now();
+        let hits = index::search_with_date_range(
+            &index,
+            "/output",
+            500,
+            Category::Image,
+            SortOrder::Latest,
+            false,
+            Some(&mask),
+            Some(since),
+            Some(until),
+            true,
+        );
+        assert!(
+            hits.iter()
+                .all(|&id| index.modified(id).is_some_and(|d| d >= since && d < until))
+        );
+        count = black_box(hits).len();
+        if round >= 3 {
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    println!(
+        "/output,personal-images-custom-range,{:.3},{:.3},{count}",
+        times[10], times[19]
+    );
 }
