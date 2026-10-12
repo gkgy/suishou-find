@@ -24,7 +24,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 620.0])
             .with_min_inner_size([680.0, 420.0])
-            .with_title("随手找"),
+            .with_title(format!("随手找 v{}", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
 
@@ -582,7 +582,7 @@ impl eframe::App for MiaoFindApp {
         self.receive_dates(&context);
         egui::Panel::top("search_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("随手找").strong());
+                ui.label(RichText::new(format!("随手找 v{}", env!("CARGO_PKG_VERSION"))).strong());
                 ui.add_enabled_ui(!self.scanning, |ui| {
                     ui.menu_button("索引", |ui| {
                         if ui.button("全盘索引").clicked() {

@@ -592,6 +592,13 @@ fn save_compact(index: &CompactIndex) -> Result<(), String> {
     Ok(())
 }
 
+/// Read a frozen index and its date cache without walking the filesystem or replaying changes.
+pub fn load_compact_with_dates(path: &Path, dates: &Path) -> Result<CompactIndex, String> {
+    let mut index = load_compact(path)?;
+    load_dates(&mut index, dates)?;
+    Ok(index)
+}
+
 pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
     let mut reader = BufReader::with_capacity(
         1024 * 1024,
@@ -1063,6 +1070,21 @@ pub fn search_filtered_with_scope(
         }
         mask
     };
+    // Name-only searches do not need one byte of inherited path masks per record.
+    if !include_paths {
+        let mut results: Vec<_> = index
+            .records
+            .par_iter()
+            .enumerate()
+            .filter_map(|(id, _)| {
+                (index.is_alive(id) && eligible(id) && match_mask(id) == required).then_some(id)
+            })
+            .take_any(limit)
+            .collect();
+        results.sort_unstable();
+        return results;
+    }
+
     // Keep filename masks so path fallback never searches a name twice.
     let mut masks = vec![0u8; index.records.len()];
     let probe_len = index.records.len().min(50_000);
