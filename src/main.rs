@@ -44,6 +44,8 @@ struct MiaoFindApp {
     last_query: String,
     category: Category,
     last_category: Category,
+    include_paths: bool,
+    last_include_paths: bool,
     sort_order: SortOrder,
     last_sort_order: SortOrder,
     date_receiver: Option<Receiver<Vec<(u64, i64, i64)>>>,
@@ -71,7 +73,7 @@ impl MiaoFindApp {
         let hotkey_requested = Arc::new(AtomicBool::new(false));
         let (hotkey_manager, hotkey_status) =
             install_global_hotkey(&context.egui_ctx, Arc::clone(&hotkey_requested));
-        let mut app = match index::load() {
+        let mut app = match index::load_cached() {
             Ok(index) => {
                 let count = index.len();
                 let roots = index.roots().to_vec();
@@ -84,6 +86,8 @@ impl MiaoFindApp {
                     last_query: String::new(),
                     category: Category::All,
                     last_category: Category::All,
+                    include_paths: false,
+                    last_include_paths: false,
                     sort_order: SortOrder::Latest,
                     last_sort_order: SortOrder::Latest,
                     date_receiver: None,
@@ -116,6 +120,8 @@ impl MiaoFindApp {
                 last_query: String::new(),
                 category: Category::All,
                 last_category: Category::All,
+                include_paths: false,
+                last_include_paths: false,
                 sort_order: SortOrder::Latest,
                 last_sort_order: SortOrder::Latest,
                 date_receiver: None,
@@ -140,6 +146,13 @@ impl MiaoFindApp {
         }
         app.start_watcher();
         app.start_dates();
+        let (sender, receiver) = mpsc::channel();
+        app.update_receiver = Some(receiver);
+        let repaint = app.app_context.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(index::pending_journal_delta());
+            repaint.request_repaint();
+        });
         app
     }
 
@@ -365,16 +378,18 @@ impl MiaoFindApp {
         if self.query == self.last_query
             && self.category == self.last_category
             && self.sort_order == self.last_sort_order
+            && self.include_paths == self.last_include_paths
         {
             return;
         }
         let started = Instant::now();
-        self.results = index::search_sorted(
+        self.results = index::search_sorted_with_scope(
             &self.index,
             &self.query,
             500,
             self.category,
             self.sort_order,
+            self.include_paths,
         );
         if !self
             .selected_result
@@ -386,6 +401,7 @@ impl MiaoFindApp {
         self.last_query.clone_from(&self.query);
         self.last_category = self.category;
         self.last_sort_order = self.sort_order;
+        self.last_include_paths = self.include_paths;
     }
 
     fn move_selection(&mut self, direction: isize) {
@@ -589,12 +605,18 @@ impl eframe::App for MiaoFindApp {
                         }
                     });
                 });
-                ui.label("⌥ Space 唤起 · 双击打开 · 右键更多操作");
+                ui.checkbox(&mut self.include_paths, "同时匹配路径")
+                    .on_hover_text("开启后，父目录名称也参与匹配，例如用项目名查找项目内文件");
+                ui.label("⌥ Space 唤起 · 双击打开");
             });
             let response = ui.add_sized(
                 [ui.available_width(), 30.0],
                 egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("搜索文件名或路径，空格组合关键词")
+                    .hint_text(if self.include_paths {
+                        "搜索名称和路径，空格组合关键词"
+                    } else {
+                        "搜索文件或文件夹名称，空格组合关键词"
+                    })
                     .font(egui::FontId::proportional(16.0)),
             );
             if context.input(|i| i.key_pressed(egui::Key::Escape)) {

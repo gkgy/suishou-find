@@ -387,13 +387,24 @@ pub fn search_sorted(
     category: Category,
     order: SortOrder,
 ) -> Vec<usize> {
+    search_sorted_with_scope(index, query, limit, category, order, true)
+}
+
+pub fn search_sorted_with_scope(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    order: SortOrder,
+    include_paths: bool,
+) -> Vec<usize> {
     if order != SortOrder::Name && !index.dates_ready {
-        return search_filtered(index, query, limit, category);
+        return search_filtered_with_scope(index, query, limit, category, include_paths);
     }
     if limit == 0 {
         return Vec::new();
     }
-    let mut results = search_filtered(index, query, usize::MAX, category);
+    let mut results = search_filtered_with_scope(index, query, usize::MAX, category, include_paths);
     let compare = |a: &usize, b: &usize| {
         if order == SortOrder::Name {
             return index.name(*a).cmp(index.name(*b)).then_with(|| a.cmp(b));
@@ -487,6 +498,16 @@ fn legacy_path() -> Result<PathBuf, String> {
 }
 
 pub fn load() -> Result<CompactIndex, String> {
+    let mut index = load_cached()?;
+    index.apply_delta(pending_journal_delta()?)?;
+    Ok(index)
+}
+
+pub fn pending_journal_delta() -> Result<IndexDelta, String> {
+    collect_delta(read_journal()?, false)
+}
+
+pub fn load_cached() -> Result<CompactIndex, String> {
     let path = compact_index_path()?;
     let mut index = if path.exists() {
         load_compact(&path)?
@@ -496,10 +517,6 @@ pub fn load() -> Result<CompactIndex, String> {
         CompactIndex::default()
     };
     let _ = load_dates(&mut index, &data_dir()?.join("modified-v1.bin"));
-    let paths = read_journal()?;
-    if !paths.is_empty() {
-        index.apply_delta(collect_delta(paths, false)?)?;
-    }
     Ok(index)
 }
 
@@ -1003,6 +1020,16 @@ pub fn search_filtered(
     limit: usize,
     category: Category,
 ) -> Vec<usize> {
+    search_filtered_with_scope(index, query, limit, category, true)
+}
+
+pub fn search_filtered_with_scope(
+    index: &CompactIndex,
+    query: &str,
+    limit: usize,
+    category: Category,
+    include_paths: bool,
+) -> Vec<usize> {
     let mut tokens: Vec<&str> = query
         .split_whitespace()
         .filter(|token| !token.is_empty())
@@ -1065,6 +1092,11 @@ pub fn search_filtered(
         direct_results.append(&mut parallel_results);
     }
     if direct_results.len() == limit {
+        direct_results.sort_unstable();
+        return direct_results;
+    }
+
+    if !include_paths {
         direct_results.sort_unstable();
         return direct_results;
     }
@@ -1189,6 +1221,41 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+    #[test]
+    fn name_scope_excludes_parent_only_matches_with_sort_and_category() {
+        use super::{Category, SortOrder, search_sorted_with_scope};
+        let index = sample();
+        for order in [SortOrder::Latest, SortOrder::Oldest, SortOrder::Name] {
+            let names =
+                search_sorted_with_scope(&index, "冷暖站", 500, Category::All, order, false);
+            assert_eq!(
+                names.iter().map(|id| index.name(*id)).collect::<Vec<_>>(),
+                vec!["冷暖站"]
+            );
+            assert!(
+                search_sorted_with_scope(&index, "冷暖站", 500, Category::Document, order, false)
+                    .is_empty()
+            );
+            let paths =
+                search_sorted_with_scope(&index, "冷暖站", 500, Category::Document, order, true);
+            assert_eq!(paths.len(), 1);
+            assert_eq!(index.name(paths[0]), "SCADA恢复记录.md");
+            assert!(
+                search_sorted_with_scope(&index, "冷暖站 md", 500, Category::All, order, false)
+                    .is_empty()
+            );
+            assert_eq!(
+                search_sorted_with_scope(&index, "冷暖站 md", 500, Category::All, order, true)
+                    .len(),
+                1
+            );
+            assert_eq!(
+                search_sorted_with_scope(&index, "scada MD", 500, Category::Document, order, false)
+                    .len(),
+                1
+            );
+        }
     }
     #[test]
     fn newest_is_selected_before_limit_and_unknown_dates_are_last() {
