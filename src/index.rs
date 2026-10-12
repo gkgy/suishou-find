@@ -1802,7 +1802,13 @@ mod personal_tests {
         };
         assert_eq!(index.name(run("/output", 1)[0]), "recent.png");
         assert_eq!(run("/output", 500).len(), 4);
-        assert_eq!(index.name(run("/output baby", 500)[0]), "baby.png");
+        assert_eq!(index.name(run("baby /output", 500)[0]), "baby.png");
+        assert_eq!(run("baby /output", 500), run("/output baby", 500));
+        assert_eq!(
+            run("baby /work /output", 500),
+            run("/output baby /work", 500)
+        );
+        assert!(run("baby output", 500).is_empty());
         assert_eq!(run("", 500).len(), 4);
         assert_eq!(
             search_with_options(
