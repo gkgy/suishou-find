@@ -12,12 +12,9 @@ use std::{
 };
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText};
-use global_hotkey::{
-    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
-    hotkey::{Code, HotKey, Modifiers},
-};
 use miao_find::index::{self, Category, CompactIndex, IndexDelta, ScanMessage, SortOrder};
 mod filters;
+mod shortcut;
 mod thumbnails;
 use filters::{Preferences, SavedFilter};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -75,7 +72,10 @@ struct MiaoFindApp {
     last_watch_event: Option<Instant>,
     watcher_started: Option<Instant>,
     query_ms: f64,
-    _hotkey_manager: Option<GlobalHotKeyManager>,
+    hotkey: Option<shortcut::Controller>,
+    shortcut_editor: bool,
+    shortcut_draft: shortcut::Shortcut,
+    shortcut_feedback: String,
     hotkey_requested: Arc<AtomicBool>,
     focus_search: bool,
     app_context: egui::Context,
@@ -87,8 +87,6 @@ impl MiaoFindApp {
         install_chinese_font(&context.egui_ctx);
         index::warm_up_parallel_search();
         let hotkey_requested = Arc::new(AtomicBool::new(false));
-        let (hotkey_manager, hotkey_status) =
-            install_global_hotkey(&context.egui_ctx, Arc::clone(&hotkey_requested));
         let mut app = match index::load_cached() {
             Ok(index) => {
                 let count = index.len();
@@ -133,7 +131,10 @@ impl MiaoFindApp {
                     last_watch_event: None,
                     watcher_started: None,
                     query_ms: 0.0,
-                    _hotkey_manager: hotkey_manager,
+                    hotkey: None,
+                    shortcut_editor: false,
+                    shortcut_draft: shortcut::Shortcut::default(),
+                    shortcut_feedback: String::new(),
                     hotkey_requested,
                     focus_search: false,
                     app_context: context.egui_ctx.clone(),
@@ -175,7 +176,10 @@ impl MiaoFindApp {
                 last_watch_event: None,
                 watcher_started: None,
                 query_ms: 0.0,
-                _hotkey_manager: hotkey_manager,
+                hotkey: None,
+                shortcut_editor: false,
+                shortcut_draft: shortcut::Shortcut::default(),
+                shortcut_feedback: String::new(),
                 hotkey_requested,
                 focus_search: false,
                 app_context: context.egui_ctx.clone(),
@@ -189,7 +193,14 @@ impl MiaoFindApp {
             &app.preferences.personal_roots,
             &app.preferences.exclusions,
         );
+        let (controller, hotkey_status) = shortcut::Controller::new(
+            &context.egui_ctx,
+            Arc::clone(&app.hotkey_requested),
+            &app.preferences.shortcut,
+        );
+        app.hotkey = Some(controller);
         if let Some(error) = hotkey_status {
+            app.shortcut_feedback = error.clone();
             app.status = error;
         }
         app.start_watcher();
@@ -205,6 +216,64 @@ impl MiaoFindApp {
     }
 
     fn filter_windows(&mut self, context: &egui::Context) {
+        if self.shortcut_editor {
+            let mut open = true;
+            egui::Window::new("快捷键设置")
+                .open(&mut open)
+                .show(context, |ui| {
+                    ui.label("设置全局显示 / 隐藏窗口的快捷键，默认 ⌥ Space。");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.shortcut_draft.command, "⌘ Command");
+                        ui.checkbox(&mut self.shortcut_draft.option, "⌥ Option");
+                        ui.checkbox(&mut self.shortcut_draft.control, "⌃ Control");
+                        ui.checkbox(&mut self.shortcut_draft.shift, "⇧ Shift");
+                    });
+                    egui::ComboBox::from_id_salt("shortcut_key")
+                        .selected_text(&self.shortcut_draft.key)
+                        .show_ui(ui, |ui| {
+                            for key in shortcut::Shortcut::keys() {
+                                ui.selectable_value(&mut self.shortcut_draft.key, key.clone(), key);
+                            }
+                        });
+                    ui.label(format!("将设置为：{}", self.shortcut_draft.label()));
+                    ui.label(
+                        "至少选择 ⌘ / ⌥ / ⌃ 之一；F 键可能需要配合 Fn。系统保留组合可能不响应。",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.shortcut_draft.parse().is_ok(),
+                                egui::Button::new("保存并应用"),
+                            )
+                            .clicked()
+                        {
+                            let result = self.hotkey.as_mut().unwrap().apply(&self.shortcut_draft);
+                            match result {
+                                Ok(()) => {
+                                    self.preferences.shortcut = self.shortcut_draft.clone();
+                                    self.shortcut_feedback = format!(
+                                        "已设置为 {}，重启后仍会保留",
+                                        self.preferences.shortcut.label()
+                                    );
+                                    self.status = self.shortcut_feedback.clone();
+                                }
+                                Err(e) => {
+                                    self.shortcut_feedback = format!("{e}；当前设置未更改");
+                                }
+                            }
+                        }
+                        if ui.button("恢复默认").clicked() {
+                            self.shortcut_draft = shortcut::Shortcut::default();
+                            self.shortcut_feedback = "已选默认组合，点击‘保存并应用’生效".into();
+                        }
+                    });
+                    if !self.shortcut_feedback.is_empty() {
+                        ui.label(&self.shortcut_feedback);
+                    }
+                });
+            self.shortcut_editor = open;
+        }
+
         if self.scope_editor {
             let mut open = true;
             egui::Window::new("我的资料范围")
@@ -651,29 +720,6 @@ fn format_modified(value: Option<i64>) -> String {
     )
 }
 
-fn install_global_hotkey(
-    context: &egui::Context,
-    requested: Arc<AtomicBool>,
-) -> (Option<GlobalHotKeyManager>, Option<String>) {
-    let hotkey = HotKey::new(Some(Modifiers::ALT), Code::Space);
-    let hotkey_id = hotkey.id();
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(manager) => manager,
-        Err(error) => return (None, Some(format!("全局快捷键初始化失败：{error}"))),
-    };
-    if let Err(error) = manager.register(hotkey) {
-        return (None, Some(format!("⌥ Space 已被其他应用占用：{error}")));
-    }
-    let repaint = context.clone();
-    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-        if event.id == hotkey_id && event.state == HotKeyState::Pressed {
-            requested.store(true, Ordering::Release);
-            repaint.request_repaint();
-        }
-    }));
-    (Some(manager), None)
-}
-
 fn is_index_relevant(kind: &notify::EventKind) -> bool {
     matches!(
         kind,
@@ -810,7 +856,16 @@ impl eframe::App for MiaoFindApp {
                 });
                 ui.checkbox(&mut self.include_paths, "同时匹配路径")
                     .on_hover_text("开启后，父目录名称也参与匹配，例如用项目名查找项目内文件");
-                ui.label("⌥ Space 唤起 · 双击打开");
+                let active = self.hotkey.as_ref().is_some_and(|c| c.active());
+                ui.label(format!(
+                    "{} {} · 双击打开",
+                    self.preferences.shortcut.label(),
+                    if active { "唤起" } else { "未生效" }
+                ));
+                if ui.button("快捷键设置").clicked() {
+                    self.shortcut_draft = self.preferences.shortcut.clone();
+                    self.shortcut_editor = true;
+                }
             });
             let response = ui
                 .horizontal(|ui| {

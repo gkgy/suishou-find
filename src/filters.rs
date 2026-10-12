@@ -33,6 +33,8 @@ impl SavedFilter {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
+    #[serde(default)]
+    pub shortcut: crate::shortcut::Shortcut,
     pub personal_roots: Vec<PathBuf>,
     pub saved: Vec<SavedFilter>,
     #[serde(default = "miao_find::index::default_personal_exclusions")]
@@ -41,6 +43,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            shortcut: crate::shortcut::Shortcut::default(),
             personal_roots: default_roots(),
             saved: Vec::new(),
             exclusions: miao_find::index::default_personal_exclusions(),
@@ -105,6 +108,7 @@ mod tests {
         filter.name = "my outputs".into();
         filter.query = "/output baby".into();
         preferences.saved.push(filter);
+        preferences.shortcut.shift = true;
         eframe::set_value(&mut storage, "prefs", &preferences);
         let restored: super::Preferences = eframe::get_value(&storage, "prefs").unwrap();
         assert_eq!(restored.personal_roots, preferences.personal_roots);
@@ -114,5 +118,6 @@ mod tests {
         assert_eq!(f.category, miao_find::index::Category::Image);
         assert_eq!(f.order, miao_find::index::SortOrder::Latest);
         assert_eq!(restored.exclusions, preferences.exclusions);
+        assert_eq!(restored.shortcut, preferences.shortcut);
     }
 }
