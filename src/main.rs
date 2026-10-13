@@ -52,6 +52,7 @@ struct MiaoFindApp {
     filter_signature: String,
     scope_editor: bool,
     save_editor: bool,
+    manage_filters: bool,
     bookmark_name: String,
     index: CompactIndex,
     results: Vec<usize>,
@@ -87,7 +88,7 @@ struct MiaoFindApp {
 
 impl MiaoFindApp {
     fn new(context: &eframe::CreationContext<'_>) -> Self {
-        context.egui_ctx.set_visuals(egui::Visuals::light());
+        install_visual_style(&context.egui_ctx);
         install_chinese_font(&context.egui_ctx);
         index::warm_up_parallel_search();
         let hotkey_requested = Arc::new(AtomicBool::new(false));
@@ -111,6 +112,7 @@ impl MiaoFindApp {
                     filter_signature: String::new(),
                     scope_editor: false,
                     save_editor: false,
+                    manage_filters: false,
                     bookmark_name: String::new(),
                     index,
                     results: Vec::new(),
@@ -164,6 +166,7 @@ impl MiaoFindApp {
                 filter_signature: String::new(),
                 scope_editor: false,
                 save_editor: false,
+                manage_filters: false,
                 bookmark_name: String::new(),
                 index: CompactIndex::default(),
                 results: Vec::new(),
@@ -343,9 +346,36 @@ impl MiaoFindApp {
                 });
             self.scope_editor = open;
         }
+        if self.manage_filters {
+            let mut open = true;
+            egui::Window::new("管理常用筛选")
+                .open(&mut open)
+                .default_width(420.0)
+                .show(context, |ui| {
+                    ui.label("删除已保存的筛选，不会删除文件。");
+                    if self.preferences.saved.is_empty() {
+                        ui.label("还没有保存的筛选。");
+                    }
+                    let mut remove = None;
+                    for (i, filter) in self.preferences.saved.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(&filter.name);
+                            if ui.button("删除筛选").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        self.preferences.saved.remove(i);
+                    }
+                });
+            self.manage_filters = open;
+        }
         if self.save_editor {
             let mut open = true;
             egui::Window::new("保存常用筛选")
+                .default_pos(egui::pos2(280.0, 180.0))
+                .default_width(420.0)
                 .open(&mut open)
                 .show(context, |ui| {
                     ui.label("保存关键词、分类、范围、日期、排序和缩略图设置；下次可一键恢复。");
@@ -780,6 +810,45 @@ fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
     Some(common)
 }
 
+fn install_visual_style(context: &egui::Context) {
+    let mut style = (*context.style_of(egui::Theme::Light)).clone();
+    style.visuals = egui::Visuals::light();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size = egui::vec2(40.0, 32.0);
+    style.spacing.menu_margin = egui::Margin::same(8);
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
+    style.visuals.override_text_color = Some(Color32::from_rgb(35, 40, 48));
+    style.visuals.panel_fill = Color32::from_rgb(247, 248, 250);
+    style.visuals.window_fill = Color32::from_rgb(252, 252, 253);
+    style.visuals.window_corner_radius = egui::CornerRadius::same(8);
+    style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    style.visuals.selection.bg_fill = Color32::from_rgb(213, 231, 255);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(0, 94, 190));
+    for widget in [
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(6);
+        widget.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(215, 219, 226));
+    }
+    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(242, 244, 247);
+    style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(228, 236, 246);
+    context.set_visuals(style.visuals.clone());
+    context.set_style_of(egui::Theme::Dark, style.clone());
+    context.set_style_of(egui::Theme::Light, style);
+    context.set_theme(egui::Theme::Light);
+}
+
 fn install_chinese_font(context: &egui::Context) {
     let chinese_candidates = [
         "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -835,7 +904,6 @@ impl eframe::App for MiaoFindApp {
 
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root_ui.ctx().clone();
-        context.set_visuals(egui::Visuals::light());
         self.receive_scan_updates(&context);
         self.receive_file_updates(&context);
         self.receive_dates(&context);
@@ -847,6 +915,8 @@ impl eframe::App for MiaoFindApp {
         if self.date_editor {
             let mut open = true;
             egui::Window::new("自定义修改日期范围")
+                .default_pos(egui::pos2(280.0, 180.0))
+                .default_width(420.0)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
@@ -889,183 +959,258 @@ impl eframe::App for MiaoFindApp {
                 self.date_editor = false;
             }
         }
-        egui::Panel::top("search_bar").show(root_ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("随手找 v{}", env!("CARGO_PKG_VERSION"))).strong());
-                ui.add_enabled_ui(!self.scanning, |ui| {
-                    ui.menu_button("索引", |ui| {
-                        if ui.button("全盘索引").clicked() {
-                            self.start_scan(index::full_disk_roots());
-                            ui.close();
-                        }
-                        if ui.button("选择位置…").clicked() {
-                            self.choose_roots(true);
-                            ui.close();
-                        }
-                        if !self.roots.is_empty() {
-                            if ui.button("添加位置…").clicked() {
-                                self.choose_roots(false);
+        egui::Panel::top("search_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(247, 248, 250))
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(root_ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("随手找 v{}", env!("CARGO_PKG_VERSION"))).strong(),
+                    );
+                    ui.add_enabled_ui(!self.scanning, |ui| {
+                        ui.menu_button("索引", |ui| {
+                            ui.set_min_width(220.0);
+                            if ui.button("全盘索引").clicked() {
+                                self.start_scan(index::full_disk_roots());
                                 ui.close();
                             }
-                            if ui.button("重新建立索引").clicked() {
-                                self.start_scan(self.roots.clone());
+                            if ui.button("选择位置…").clicked() {
+                                self.choose_roots(true);
                                 ui.close();
                             }
-                        }
+                            if !self.roots.is_empty() {
+                                if ui.button("添加位置…").clicked() {
+                                    self.choose_roots(false);
+                                    ui.close();
+                                }
+                                if ui.button("重新建立索引").clicked() {
+                                    self.start_scan(self.roots.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
                     });
-                });
-                ui.checkbox(&mut self.include_paths, "同时匹配路径")
-                    .on_hover_text("开启后，父目录名称也参与匹配，例如用项目名查找项目内文件");
-                let active = self.hotkey.as_ref().is_some_and(|c| c.active());
-                ui.label(format!(
-                    "{} {} · 双击打开",
-                    self.preferences.shortcut.label(),
-                    if active { "唤起" } else { "未生效" }
-                ));
-                if ui.button("快捷键设置").clicked() {
-                    self.shortcut_draft = self.preferences.shortcut.clone();
-                    self.shortcut_editor = true;
-                }
-            });
-            let response = ui
-                .horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        egui::ComboBox::from_id_salt("sort_mode")
-                            .width(140.0)
-                            .selected_text(self.sort_order.label())
-                            .show_ui(ui, |ui| {
-                                for order in [
-                                    SortOrder::Relevance,
-                                    SortOrder::Latest,
-                                    SortOrder::Oldest,
-                                    SortOrder::Name,
-                                ] {
-                                    ui.add_enabled_ui(
-                                        !matches!(order, SortOrder::Latest | SortOrder::Oldest)
-                                            || self.index.dates_ready(),
-                                        |ui| {
-                                            ui.selectable_value(
-                                                &mut self.sort_order,
-                                                order,
-                                                order.label(),
-                                            );
-                                        },
-                                    );
-                                }
-                            });
-                        ui.add_sized(
-                            [ui.available_width(), 30.0],
-                            egui::TextEdit::singleline(&mut self.query)
-                                .hint_text(if self.include_paths {
-                                    "搜索名称和路径，空格组合关键词"
-                                } else {
-                                    "搜索文件或文件夹名称，空格组合关键词"
-                                })
-                                .font(egui::FontId::proportional(16.0)),
-                        )
-                    })
-                    .inner
-                })
-                .inner;
-            ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.personal, false, "全部位置");
-                ui.selectable_value(&mut self.personal, true, "我的资料");
-                if ui.small_button("范围…").clicked() {
-                    self.exclusion_text = self.preferences.exclusions.join("\n");
-                    self.scope_editor = true;
-                }
-                ui.separator();
-                ui.add_enabled_ui(self.index.dates_ready(), |ui| {
-                    egui::ComboBox::from_id_salt("date_range")
-                        .selected_text(self.time_range.label())
-                        .show_ui(ui, |ui| {
-                            for range in [
-                                TimeRange::Any,
-                                TimeRange::Days3,
-                                TimeRange::Week,
-                                TimeRange::Month,
-                                TimeRange::Year,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.time_range,
-                                    range.clone(),
-                                    range.label(),
-                                );
-                            }
-                            if ui
-                                .selectable_label(
-                                    matches!(self.time_range, TimeRange::Custom { .. }),
-                                    "自定义日期…",
-                                )
-                                .clicked()
-                            {
-                                if let TimeRange::Custom { start, end } = &self.time_range {
-                                    self.date_start = start.clone();
-                                    self.date_end = end.clone();
-                                }
-                                self.date_feedback.clear();
-                                self.date_editor = true;
-                                ui.close();
-                            }
-                        })
-                        .response
-                        .on_hover_text(
-                            "按修改日期；最近一个月为 30 天，最近一年为 365 天；不是最近打开时间",
-                        );
-                });
-                ui.checkbox(&mut self.thumbnails_enabled, "图片缩略图");
-                ui.checkbox(&mut self.raster, "仅可预览图片")
-                    .on_hover_text("PNG / JPEG / WebP / GIF；取消后显示其他格式");
-                if ui.button("保存筛选…").clicked() {
-                    self.save_editor = true;
-                }
-                ui.menu_button("常用筛选", |ui| {
-                    if ui.button("最近生成的图片").clicked() {
-                        self.apply_filter(SavedFilter::recent_images());
-                        ui.close();
+                    ui.checkbox(&mut self.include_paths, "同时匹配路径")
+                        .on_hover_text("开启后，父目录名称也参与匹配，例如用项目名查找项目内文件");
+                    let active = self.hotkey.as_ref().is_some_and(|c| c.active());
+                    ui.label(format!(
+                        "{} {} · 双击打开",
+                        self.preferences.shortcut.label(),
+                        if active { "唤起" } else { "未生效" }
+                    ));
+                    if ui.button("快捷键设置").clicked() {
+                        self.shortcut_draft = self.preferences.shortcut.clone();
+                        self.shortcut_editor = true;
                     }
-                    let saved = self.preferences.saved.clone();
-                    for (i, f) in saved.into_iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui.button(&f.name).clicked() {
-                                self.apply_filter(f.clone());
-                                ui.close();
-                            }
-                            if ui.small_button("删除").clicked() {
-                                self.preferences.saved.remove(i);
+                });
+                ui.add_space(4.0);
+                let response = ui
+                    .horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            egui::ComboBox::from_id_salt("sort_mode")
+                                .width(170.0)
+                                .selected_text(self.sort_order.label())
+                                .show_ui(ui, |ui| {
+                                    for order in [
+                                        SortOrder::Relevance,
+                                        SortOrder::Latest,
+                                        SortOrder::Oldest,
+                                        SortOrder::Name,
+                                    ] {
+                                        ui.add_enabled_ui(
+                                            !matches!(order, SortOrder::Latest | SortOrder::Oldest)
+                                                || self.index.dates_ready(),
+                                            |ui| {
+                                                ui.selectable_value(
+                                                    &mut self.sort_order,
+                                                    order,
+                                                    order.label(),
+                                                );
+                                            },
+                                        );
+                                    }
+                                });
+                            ui.add_sized(
+                                [ui.available_width(), 36.0],
+                                egui::TextEdit::singleline(&mut self.query)
+                                    .hint_text(if self.include_paths {
+                                        "搜索名称和路径，空格组合关键词"
+                                    } else {
+                                        "搜索文件或文件夹名称，空格组合关键词"
+                                    })
+                                    .font(egui::FontId::proportional(16.0)),
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("scope_mode")
+                        .width(140.0)
+                        .selected_text(if self.personal {
+                            "我的资料"
+                        } else {
+                            "全部位置"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.set_min_width(220.0);
+                            ui.selectable_value(&mut self.personal, false, "全部位置");
+                            ui.selectable_value(&mut self.personal, true, "我的资料");
+                            ui.separator();
+                            if ui.button("编辑资料范围…").clicked() {
+                                self.exclusion_text = self.preferences.exclusions.join("\n");
+                                self.scope_editor = true;
                                 ui.close();
                             }
                         });
-                    }
+                    ui.add_enabled_ui(self.index.dates_ready(), |ui| {
+                        egui::ComboBox::from_id_salt("date_range")
+                            .width(140.0)
+                            .selected_text(self.time_range.label())
+                            .show_ui(ui, |ui| {
+                                ui.set_min_width(220.0);
+                                ui.selectable_value(
+                                    &mut self.time_range,
+                                    TimeRange::Any,
+                                    "不限时间",
+                                );
+                                ui.separator();
+                                for range in [
+                                    TimeRange::Days3,
+                                    TimeRange::Week,
+                                    TimeRange::Month,
+                                    TimeRange::Year,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.time_range,
+                                        range.clone(),
+                                        range.label(),
+                                    );
+                                }
+                                ui.separator();
+                                if ui
+                                    .selectable_label(
+                                        matches!(self.time_range, TimeRange::Custom { .. }),
+                                        "自定义日期…",
+                                    )
+                                    .clicked()
+                                {
+                                    if let TimeRange::Custom { start, end } = &self.time_range {
+                                        self.date_start = start.clone();
+                                        self.date_end = end.clone();
+                                    }
+                                    self.date_feedback.clear();
+                                    self.date_editor = true;
+                                    ui.close();
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "按修改时间筛选；一个月为30天，一年为365天；不是最近打开时间",
+                            );
+                    });
+                    ui.menu_button("常用筛选", |ui| {
+                        ui.set_min_width(240.0);
+                        let preset = SavedFilter::recent_images();
+                        let selected = self.query == preset.query
+                            && self.category == preset.category
+                            && self.personal == preset.personal
+                            && self.time_range == preset.time_range
+                            && self.sort_order == preset.order
+                            && self.include_paths == preset.paths
+                            && self.raster == preset.raster
+                            && self.thumbnails_enabled == preset.thumbnails;
+                        if ui
+                            .add(egui::Button::new(&preset.name).selected(selected))
+                            .clicked()
+                        {
+                            self.apply_filter(preset);
+                            ui.close();
+                        }
+                        for f in self.preferences.saved.clone() {
+                            let selected = self.query == f.query
+                                && self.category == f.category
+                                && self.personal == f.personal
+                                && self.time_range == f.effective_time_range()
+                                && self.sort_order == f.order
+                                && self.include_paths == f.paths
+                                && self.raster == f.raster
+                                && self.thumbnails_enabled == f.thumbnails;
+                            if ui
+                                .add(egui::Button::new(&f.name).selected(selected))
+                                .clicked()
+                            {
+                                self.apply_filter(f);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("保存当前筛选…").clicked() {
+                            self.save_editor = true;
+                            ui.close();
+                        }
+                        if ui.button("管理筛选…").clicked() {
+                            self.manage_filters = true;
+                            ui.close();
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.menu_button("设置", |ui| {
+                            ui.set_min_width(240.0);
+                            ui.checkbox(&mut self.raster, "仅可预览图片")
+                                .on_hover_text("仅PNG / JPEG / WebP / GIF");
+                            ui.separator();
+                            if ui.button("我的资料范围…").clicked() {
+                                self.exclusion_text = self.preferences.exclusions.join("\n");
+                                self.scope_editor = true;
+                                ui.close();
+                            }
+                            if ui.button("快捷键设置…").clicked() {
+                                self.shortcut_draft = self.preferences.shortcut.clone();
+                                self.shortcut_editor = true;
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        ui.selectable_value(&mut self.thumbnails_enabled, true, "缩略图");
+                        ui.selectable_value(&mut self.thumbnails_enabled, false, "列表");
+                    });
                 });
-            });
-            if self.personal {
-                ui.label(
-                    RichText::new(format!(
-                        "我的资料 · {} 个目录（可在‘范围’中查看）",
-                        self.preferences.personal_roots.len()
-                    ))
-                    .small(),
-                );
-            }
-            if let TimeRange::Custom { start, end } = &self.time_range {
-                ui.label(
-                    RichText::new(format!("修改日期：{start} 至 {end}（包含结束当天）")).small(),
-                );
-            }
-            if context.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if self.query.is_empty() {
-                    context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                } else {
-                    self.query.clear();
-                    response.request_focus();
+                if self.raster {
+                    ui.label(RichText::new("格式筛选：仅可预览图片（可在‘设置’中取消）").small());
                 }
-            }
-            if self.focus_search {
-                response.request_focus();
-                self.focus_search = false;
-            }
-        });
+                if self.personal {
+                    ui.label(
+                        RichText::new(format!(
+                            "我的资料 · {} 个目录（可在‘范围’中查看）",
+                            self.preferences.personal_roots.len()
+                        ))
+                        .small(),
+                    );
+                }
+                if let TimeRange::Custom { start, end } = &self.time_range {
+                    ui.label(
+                        RichText::new(format!("修改日期：{start} 至 {end}（包含结束当天）"))
+                            .small(),
+                    );
+                }
+                if context.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if self.query.is_empty() {
+                        context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    } else {
+                        self.query.clear();
+                        response.request_focus();
+                    }
+                }
+                if self.focus_search {
+                    response.request_focus();
+                    self.focus_search = false;
+                }
+            });
         egui::Panel::bottom("status_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 if self.scanning || self.date_receiver.is_some() {
@@ -1089,7 +1234,7 @@ impl eframe::App for MiaoFindApp {
             });
         });
         egui::Panel::left("categories")
-            .default_size(135.0)
+            .default_size(155.0)
             .min_size(110.0)
             .max_size(220.0)
             .show(root_ui, |ui| {
@@ -1097,10 +1242,21 @@ impl eframe::App for MiaoFindApp {
                 ui.separator();
                 for kind in Category::ALL {
                     ui.add_sized(
-                        [ui.available_width(), 27.0],
+                        [ui.available_width(), 34.0],
                         egui::Button::new("")
-                            .left_text(kind.label())
-                            .frame_when_inactive(false)
+                            .left_text(RichText::new(kind.label()).color(
+                                if self.category == kind {
+                                    Color32::from_rgb(0, 94, 190)
+                                } else {
+                                    Color32::from_rgb(35, 40, 48)
+                                },
+                            ))
+                            .fill(if self.category == kind {
+                                Color32::from_rgb(213, 231, 255)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::NONE)
                             .selected(self.category == kind),
                     )
                     .clicked()
@@ -1127,7 +1283,8 @@ impl eframe::App for MiaoFindApp {
                                 "名称 ↑"
                             } else {
                                 "名称"
-                            }),
+                            })
+                            .frame(false),
                         )
                         .clicked()
                     {
@@ -1142,7 +1299,9 @@ impl eframe::App for MiaoFindApp {
                     if ui
                         .add_enabled(
                             self.index.dates_ready(),
-                            egui::Button::new(label).min_size(egui::vec2(date_width, 27.0)),
+                            egui::Button::new(label)
+                                .frame(false)
+                                .min_size(egui::vec2(date_width, 27.0)),
                         )
                         .clicked()
                     {
@@ -1242,7 +1401,7 @@ impl eframe::App for MiaoFindApp {
                                             rect.min + egui::vec2(34.0, height / 2.0),
                                             egui::Align2::CENTER_CENTER,
                                             "图片",
-                                            egui::FontId::proportional(12.0),
+                                            egui::FontId::proportional(13.0),
                                             color,
                                         );
                                     }
