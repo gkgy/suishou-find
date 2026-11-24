@@ -43,10 +43,10 @@ impl Shortcut {
     }
     pub fn parse(&self) -> Result<HotKey, String> {
         if !(self.command || self.option || self.control) {
-            return Err("至少选择 ⌘、⌥、⌃ 中的一个，避免影响普通输入".into());
+            return Err(crate::i18n::tr("至少选择 ⌘、⌥、⌃ 中的一个，避免影响普通输入").into());
         }
         if !Self::keys().contains(&self.key) {
-            return Err("请选择空格、字母、数字或 F1–F12".into());
+            return Err(crate::i18n::tr("请选择空格、字母、数字或 F1–F12").into());
         }
         let mut parts = Vec::new();
         if self.command {
@@ -65,7 +65,7 @@ impl Shortcut {
         parts
             .join("+")
             .parse::<HotKey>()
-            .map_err(|e| format!("快捷键无效：{e}"))
+            .map_err(|e| crate::i18n::localized_format!("快捷键无效：{e}", "Invalid shortcut: {e}"))
     }
 }
 trait Registrar {
@@ -84,16 +84,20 @@ fn replace(registrar: &impl Registrar, old: Option<HotKey>, new: HotKey) -> Resu
     if old == Some(new) {
         return Ok(());
     }
-    registrar
-        .register_key(new)
-        .map_err(|e| format!("无法注册，可能被其他应用或系统占用：{e}；请换一个组合"))?;
+    registrar.register_key(new).map_err(|e| {
+        crate::i18n::localized_format!(
+            "无法注册，可能被其他应用或系统占用：{e}；请换一个组合",
+            "Could not register shortcut (possibly already in use): {e}; choose another combination"
+        )
+    })?;
     if let Some(old) = old {
         if let Err(error) = registrar.unregister_key(old) {
             let rollback = registrar.unregister_key(new);
-            return Err(format!(
+            return Err(crate::i18n::localized_format!(
                 "旧快捷键释放失败：{error}；新快捷键未保存{}",
+                "Could not release old shortcut: {error}; new shortcut not saved{}",
                 if rollback.is_err() {
-                    "，请重启应用后重试"
+                    crate::i18n::tr("，请重启应用后重试")
                 } else {
                     ""
                 }
@@ -123,10 +127,12 @@ impl Controller {
             }
         }));
         let manager = GlobalHotKeyManager::new();
-        let error = manager
-            .as_ref()
-            .err()
-            .map(|e| format!("快捷键初始化失败：{e}"));
+        let error = manager.as_ref().err().map(|e| {
+            crate::i18n::localized_format!(
+                "快捷键初始化失败：{e}",
+                "Could not initialize shortcut: {e}"
+            )
+        });
         let mut controller = Self {
             manager: manager.ok(),
             active: None,
@@ -138,8 +144,12 @@ impl Controller {
     pub fn apply(&mut self, config: &Shortcut) -> Result<(), String> {
         let key = config.parse()?;
         if self.manager.is_none() {
-            self.manager =
-                Some(GlobalHotKeyManager::new().map_err(|e| format!("快捷键初始化失败：{e}"))?);
+            self.manager = Some(GlobalHotKeyManager::new().map_err(|e| {
+                crate::i18n::localized_format!(
+                    "快捷键初始化失败：{e}",
+                    "Could not initialize shortcut: {e}"
+                )
+            })?);
         }
         replace(self.manager.as_ref().unwrap(), self.active, key)?;
         self.active_id.store(key.id(), Ordering::Release);

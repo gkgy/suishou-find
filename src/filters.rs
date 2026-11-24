@@ -20,9 +20,97 @@ pub struct SavedFilter {
     pub raster: bool,
 }
 impl SavedFilter {
+    pub fn empty() -> Self {
+        Self {
+            name: String::new(),
+            query: String::new(),
+            category: Category::All,
+            order: SortOrder::Relevance,
+            paths: false,
+            personal: false,
+            recent: false,
+            time_range: TimeRange::Any,
+            thumbnails: false,
+            raster: false,
+        }
+    }
+    pub fn builtins() -> Vec<Self> {
+        let mut presets = Vec::new();
+        for (name, query, category, time_range, thumbnails, raster) in [
+            (
+                "最近一周的文档",
+                "",
+                Category::Document,
+                TimeRange::Week,
+                false,
+                false,
+            ),
+            (
+                "最近下载的文件",
+                "/Downloads",
+                Category::All,
+                TimeRange::Week,
+                false,
+                false,
+            ),
+            (
+                "最近一周的图片",
+                "",
+                Category::Image,
+                TimeRange::Week,
+                true,
+                true,
+            ),
+            (
+                "PDF 文档",
+                ".pdf",
+                Category::Document,
+                TimeRange::Any,
+                false,
+                false,
+            ),
+            (
+                "压缩包",
+                "",
+                Category::Archive,
+                TimeRange::Any,
+                false,
+                false,
+            ),
+            (
+                "最近修改的代码",
+                "",
+                Category::Code,
+                TimeRange::Week,
+                false,
+                false,
+            ),
+            (
+                "最近生成的图片",
+                "/output",
+                Category::Image,
+                TimeRange::Week,
+                true,
+                true,
+            ),
+        ] {
+            let mut filter = Self::empty();
+            filter.name = name.into();
+            filter.query = query.into();
+            filter.category = category;
+            filter.time_range = time_range;
+            filter.order = SortOrder::Latest;
+            filter.thumbnails = thumbnails;
+            filter.raster = raster;
+            presets.push(filter);
+        }
+        presets
+    }
+
+    #[cfg(test)]
     pub fn recent_images() -> Self {
         Self {
-            name: "最近生成的图片".into(),
+            name: crate::i18n::tr("最近生成的图片").into(),
             query: "/output".into(),
             category: Category::Image,
             order: SortOrder::Latest,
@@ -38,17 +126,29 @@ impl SavedFilter {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
     #[serde(default)]
+    pub english: bool,
+    #[serde(default = "default_preview_visible")]
+    pub preview_visible: bool,
+    #[serde(default)]
     pub shortcut: crate::shortcut::Shortcut,
     pub personal_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub scope_locations: Vec<PathBuf>,
     pub saved: Vec<SavedFilter>,
     #[serde(default = "miao_find::index::default_personal_exclusions")]
     pub exclusions: Vec<String>,
 }
+fn default_preview_visible() -> bool {
+    true
+}
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            english: false,
+            preview_visible: true,
             shortcut: crate::shortcut::Shortcut::default(),
             personal_roots: default_roots(),
+            scope_locations: default_roots(),
             saved: Vec::new(),
             exclusions: miao_find::index::default_personal_exclusions(),
         }
@@ -88,12 +188,12 @@ pub enum TimeRange {
 impl TimeRange {
     pub fn label(&self) -> &str {
         match self {
-            Self::Any => "不限时间",
-            Self::Days3 => "最近 3 天",
-            Self::Week => "最近一周",
-            Self::Month => "最近一个月",
-            Self::Year => "最近一年",
-            Self::Custom { .. } => "自定义日期…",
+            Self::Any => crate::i18n::tr("不限时间"),
+            Self::Days3 => crate::i18n::tr("最近 3 天"),
+            Self::Week => crate::i18n::tr("最近一周"),
+            Self::Month => crate::i18n::tr("最近一个月"),
+            Self::Year => crate::i18n::tr("最近一年"),
+            Self::Custom { .. } => crate::i18n::tr("自定义日期…"),
         }
     }
     pub fn relative(&self) -> bool {
@@ -118,7 +218,7 @@ impl TimeRange {
                 let start = local_date(start, false)?;
                 let end = local_date(end, true)?;
                 if start >= end {
-                    return Err("开始日期不能晚于结束日期".into());
+                    return Err(crate::i18n::tr("开始日期不能晚于结束日期").into());
                 }
                 return Ok((Some(start), Some(end)));
             }
@@ -128,7 +228,8 @@ impl TimeRange {
 }
 /// Local calendar boundaries, including DST changes. Never silently normalize invalid dates.
 fn local_date(text: &str, next_day: bool) -> Result<i64, String> {
-    let invalid = || "请输入有效日期，例如 2026-10-12（年份 1900–9999）".to_string();
+    let invalid =
+        || crate::i18n::tr("请输入有效日期，例如 2026-10-12（年份 1900–9999）").to_string();
     let parts: Vec<i32> = text
         .trim()
         .split('-')
@@ -247,8 +348,10 @@ mod tests {
         let expected = filter.time_range.clone();
         preferences.saved.push(filter);
         preferences.shortcut.shift = true;
+        preferences.english = true;
         eframe::set_value(&mut storage, "prefs", &preferences);
         let restored: super::Preferences = eframe::get_value(&storage, "prefs").unwrap();
+        assert!(restored.english);
         assert_eq!(restored.personal_roots, preferences.personal_roots);
         let f = &restored.saved[0];
         assert_eq!(f.time_range, expected);
@@ -258,5 +361,66 @@ mod tests {
         assert_eq!(f.order, miao_find::index::SortOrder::Latest);
         assert_eq!(restored.exclusions, preferences.exclusions);
         assert_eq!(restored.shortcut, preferences.shortcut);
+    }
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    #[test]
+    fn quick_searches_work_without_a_personal_scope() {
+        let presets = SavedFilter::builtins();
+        assert_eq!(presets.len(), 7);
+        for preset in &presets {
+            assert!(
+                !preset.personal,
+                "built-ins must search all indexed locations by default"
+            );
+            assert!(preset.time_range.bounds().is_ok());
+            assert!(!preset.raster || preset.category == Category::Image);
+        }
+        assert!(presets.iter().any(|p| p.query == "/Downloads"));
+        assert!(presets.iter().any(|p| p.query == ".pdf"));
+        let empty = SavedFilter::empty();
+        assert!(!empty.personal && empty.time_range == TimeRange::Any && empty.query.is_empty());
+    }
+    #[test]
+    fn saved_search_and_unselected_custom_locations_survive_restart() {
+        #[derive(Default)]
+        struct Store(std::collections::HashMap<String, String>);
+        impl eframe::Storage for Store {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.into(), value);
+            }
+            fn remove_string(&mut self, key: &str) {
+                self.0.remove(key);
+            }
+            fn flush(&mut self) {}
+        }
+        let mut filter = SavedFilter::empty();
+        filter.name = "本周项目 PDF".into();
+        filter.query = ".pdf".into();
+        filter.category = Category::Document;
+        filter.time_range = TimeRange::Week;
+        filter.personal = true;
+        let selected = PathBuf::from("/tmp/selected-project");
+        let unselected = PathBuf::from("/tmp/other-project");
+        let preferences = Preferences {
+            personal_roots: vec![selected.clone()],
+            scope_locations: vec![selected.clone(), unselected.clone()],
+            saved: vec![filter],
+            ..Default::default()
+        };
+        let mut store = Store::default();
+        eframe::set_value(&mut store, "preferences", &preferences);
+        let loaded: Preferences = eframe::get_value(&store, "preferences").unwrap();
+        assert_eq!(loaded.personal_roots, vec![selected.clone()]);
+        assert_eq!(loaded.scope_locations, vec![selected, unselected]);
+        assert_eq!(loaded.saved[0].query, ".pdf");
+        assert!(loaded.saved[0].personal);
+        assert_eq!(loaded.saved[0].effective_time_range(), TimeRange::Week);
     }
 }

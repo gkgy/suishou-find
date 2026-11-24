@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::CStr,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -19,6 +19,9 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 
 const UNKNOWN_DATE: i64 = i64::MIN;
+// Distinguish a missing cache entry from a cached "metadata unavailable" result.
+const UNCACHED_DATE: i64 = i64::MIN + 1;
+const DATE_BATCH_SIZE: usize = 2048;
 const DATE_MAGIC: &[u8; 8] = b"MIAODATE";
 const MAGIC: &[u8; 8] = b"MIAOIDX3";
 const NO_PARENT: u32 = u32::MAX;
@@ -34,10 +37,106 @@ struct Record {
     modified: i64,
 }
 
+// Share immutable filename bytes with query workers. Appends copy at most one small
+// tail chunk, so typing never copies the whole index or all matching filenames.
+const NAME_CHUNK: usize = 4 * 1024 * 1024;
+#[derive(Debug)]
+enum BaseNames {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+impl Default for BaseNames {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+impl std::ops::Deref for BaseNames {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(names) => names,
+            Self::Mapped(names) => names,
+        }
+    }
+}
+#[derive(Clone, Debug, Default)]
+struct NameStore {
+    base: Arc<BaseNames>,
+    tails: Vec<Arc<Vec<u8>>>,
+}
+impl From<Vec<u8>> for NameStore {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            base: Arc::new(BaseNames::Owned(bytes)),
+            tails: Vec::new(),
+        }
+    }
+}
+impl NameStore {
+    fn with_capacity(size: usize) -> Self {
+        Vec::with_capacity(size).into()
+    }
+    fn len(&self) -> usize {
+        self.base.len()
+            + self
+                .tails
+                .last()
+                .map_or(0, |last| (self.tails.len() - 1) * NAME_CHUNK + last.len())
+    }
+    fn prepare_name(&mut self, len: usize) {
+        if self.tails.is_empty()
+            && Arc::strong_count(&self.base) == 1
+            && matches!(*self.base, BaseNames::Owned(_))
+        {
+            return;
+        }
+        if self
+            .tails
+            .last()
+            .is_some_and(|last| last.len() + len > NAME_CHUNK)
+        {
+            Arc::make_mut(self.tails.last_mut().unwrap()).resize(NAME_CHUNK, 0);
+            self.tails.push(Arc::new(Vec::with_capacity(NAME_CHUNK)));
+        } else if self.tails.is_empty() {
+            self.tails.push(Arc::new(Vec::with_capacity(NAME_CHUNK)));
+        }
+    }
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        if let Some(last) = self.tails.last_mut() {
+            Arc::make_mut(last).extend_from_slice(bytes);
+        } else {
+            let Some(BaseNames::Owned(base)) = Arc::get_mut(&mut self.base) else {
+                unreachable!("prepare_name selects a writable tail for shared or mapped names")
+            };
+            base.extend_from_slice(bytes);
+        }
+    }
+    fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        if offset < self.base.len() {
+            return &self.base[offset..offset + len];
+        }
+        let offset = offset - self.base.len();
+        &self.tails[offset / NAME_CHUNK][offset % NAME_CHUNK..offset % NAME_CHUNK + len]
+    }
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        writer.write_all(&self.base)?;
+        for tail in &self.tails {
+            writer.write_all(tail)?;
+        }
+        Ok(())
+    }
+}
+impl std::ops::Index<std::ops::Range<usize>> for NameStore {
+    type Output = [u8];
+    fn index(&self, range: std::ops::Range<usize>) -> &[u8] {
+        self.slice(range.start, range.end - range.start)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CompactIndex {
     records: Vec<Record>,
-    names: Vec<u8>,
+    names: NameStore,
     path_hashes: Vec<u64>,
     roots: Vec<PathBuf>,
     active_count: usize,
@@ -129,7 +228,7 @@ impl CompactIndex {
         flat.dedup_by(|a, b| a.path == b.path);
         let mut index = Self {
             records: Vec::with_capacity(flat.len()),
-            names: Vec::with_capacity(flat.len().saturating_mul(20)),
+            names: NameStore::with_capacity(flat.len().saturating_mul(20)),
             path_hashes: Vec::with_capacity(flat.len()),
             roots: normalize_roots(roots),
             active_count: 0,
@@ -180,9 +279,11 @@ impl CompactIndex {
                     .ok_or_else(|| format!("无法读取文件名：{path}"))?;
                 (parent, name)
             };
-            if name.len() > u16::MAX as usize
-                || self.names.len().saturating_add(name.len()) > u32::MAX as usize
-            {
+            if name.len() > u16::MAX as usize {
+                return Err("文件名超过格式上限".to_owned());
+            }
+            self.names.prepare_name(name.len());
+            if self.names.len().saturating_add(name.len()) > u32::MAX as usize {
                 return Err("索引文字数据超过格式上限".to_owned());
             }
             let id = self.records.len() as u32;
@@ -257,7 +358,7 @@ impl CompactIndex {
                 path_hashes.push(self.path_hashes[old_id]);
             }
             self.records = records;
-            self.names = names;
+            self.names = names.into();
             self.path_hashes = path_hashes;
             self.active_count = self.records.len();
         }
@@ -295,40 +396,62 @@ fn timestamp_ms(value: SystemTime) -> i64 {
 }
 impl CompactIndex {
     pub fn modified(&self, id: usize) -> Option<i64> {
-        (self.records[id].modified != UNKNOWN_DATE).then_some(self.records[id].modified)
+        let date = self.records[id].modified;
+        (date != UNKNOWN_DATE && date != UNCACHED_DATE).then_some(date)
     }
     pub fn dates_ready(&self) -> bool {
         self.dates_ready
     }
-    pub fn collect_dates(&self) -> Vec<(u64, i64, i64)> {
-        self.records
-            .par_iter()
-            .enumerate()
-            .filter(|(_id, r)| r.flags & ALIVE != 0)
-            .map(|(id, _)| {
-                let date = fs::symlink_metadata(self.path(id))
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map(timestamp_ms)
-                    .unwrap_or(UNKNOWN_DATE);
-                (self.path_hashes[id], self.records[id].modified, date)
-            })
-            .collect()
+    pub fn record_count(&self) -> usize {
+        self.records.len()
     }
-    pub fn apply_dates(&mut self, values: Vec<(u64, i64, i64)>) {
-        let dates: HashMap<_, _> = values
-            .into_iter()
-            .map(|(hash, before, after)| (hash, (before, after)))
-            .collect();
-        for (hash, record) in self.path_hashes.iter().zip(&mut self.records) {
-            // Preserve newer metadata obtained by a concurrent file change.
-            if let Some(&(before, after)) = dates.get(hash) {
-                if record.modified == before {
-                    record.modified = after;
+    pub fn apply_historical_dates(
+        &mut self,
+        original_records: usize,
+        dates: &HashMap<u64, Option<i64>>,
+    ) {
+        if dates.is_empty() {
+            return;
+        }
+        for (&hash, record) in self
+            .path_hashes
+            .iter()
+            .zip(&mut self.records)
+            .take(original_records)
+        {
+            if record.flags & ALIVE != 0 {
+                if let Some(date) = dates.get(&hash) {
+                    record.modified = date.unwrap_or(UNKNOWN_DATE);
                 }
             }
         }
+    }
+    pub fn missing_date_batch(&self, cursor: &mut usize) -> Vec<(usize, String)> {
+        let mut paths = Vec::new();
+        if self.dates_ready {
+            return paths;
+        }
+        while *cursor < self.records.len() && paths.len() < DATE_BATCH_SIZE {
+            let id = *cursor;
+            *cursor += 1;
+            if self.is_alive(id) && self.records[id].modified == UNCACHED_DATE {
+                paths.push((id, self.path(id)));
+            }
+        }
+        paths
+    }
+    pub fn apply_date_batch(&mut self, dates: Vec<(usize, i64)>) {
+        // Updates append new records and retire old IDs. A replacement scan
+        // discards the pending receiver before any old IDs can be applied.
+        for (id, date) in dates {
+            if self.is_alive(id) && self.records[id].modified == UNCACHED_DATE {
+                self.records[id].modified = date;
+            }
+        }
+    }
+    pub fn finish_date_repair(&mut self) -> Result<(), String> {
         self.dates_ready = true;
+        self.save_dates()
     }
     pub fn save_dates(&self) -> Result<(), String> {
         if !self.dates_ready {
@@ -337,6 +460,23 @@ impl CompactIndex {
         save_dates_to(self, &data_dir()?.join("modified-v1.bin"))
     }
 }
+pub fn file_date(path: &Path) -> Option<i64> {
+    fs::symlink_metadata(path)
+        .ok()?
+        .modified()
+        .ok()
+        .map(timestamp_ms)
+}
+pub fn read_date_batch(paths: Vec<(usize, String)>) -> Vec<(usize, i64)> {
+    paths
+        .into_iter()
+        .map(|(id, path)| {
+            let date = file_date(Path::new(&path)).unwrap_or(UNKNOWN_DATE);
+            (id, date)
+        })
+        .collect()
+}
+
 fn save_dates_to(index: &CompactIndex, path: &Path) -> Result<(), String> {
     let temporary = path.with_extension("tmp");
     let mut writer = BufWriter::with_capacity(
@@ -371,6 +511,28 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
     {
         return Err("日期缓存损坏".into());
     }
+    // The writer emits the same order as the index. Stream directly into
+    // records on a normal launch, checking every path before accepting its date.
+    if count == index.active_count as u64 {
+        let mut aligned = true;
+        for (&expected, record) in index.path_hashes.iter().zip(&mut index.records) {
+            if record.flags & ALIVE == 0 {
+                continue;
+            }
+            if read_u64(&mut reader)? != expected {
+                aligned = false;
+                break;
+            }
+            record.modified = read_u64(&mut reader)? as i64;
+        }
+        if aligned {
+            index.dates_ready = true;
+            return Ok(());
+        }
+        reader
+            .seek(SeekFrom::Start(16))
+            .map_err(|error| error.to_string())?;
+    }
     let mut dates = HashMap::with_capacity(count as usize);
     for _ in 0..count {
         let hash = read_u64(&mut reader)?;
@@ -384,9 +546,7 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
         .filter(|(_, r)| r.flags & ALIVE != 0)
         .all(|(hash, _)| dates.contains_key(hash));
     for (hash, record) in index.path_hashes.iter().zip(&mut index.records) {
-        if let Some(&date) = dates.get(hash) {
-            record.modified = date;
-        }
+        record.modified = dates.get(hash).copied().unwrap_or(UNCACHED_DATE);
     }
     Ok(())
 }
@@ -527,6 +687,39 @@ pub fn search_with_date_range(
     if limit == 0 {
         return Vec::new();
     }
+    let (name_query, hits) = matching_hits(
+        index,
+        query,
+        category,
+        include_paths,
+        personal,
+        since,
+        until,
+        raster,
+    );
+    sort_hits(index, &name_query, limit, category, order, hits)
+}
+
+fn matching_hits(
+    index: &CompactIndex,
+    query: &str,
+    category: Category,
+    include_paths: bool,
+    personal: Option<&[bool]>,
+    since: Option<i64>,
+    until: Option<i64>,
+    raster: bool,
+) -> (String, Vec<usize>) {
+    // Empty startup stays empty; an explicit type/scope/date filter can browse files.
+    if query.trim().is_empty()
+        && category == Category::All
+        && personal.is_none()
+        && since.is_none()
+        && until.is_none()
+        && !raster
+    {
+        return (String::new(), Vec::new());
+    }
     let (path_terms, name_terms): (Vec<_>, Vec<_>) =
         query.split_whitespace().partition(|t| t.contains('/'));
     let name_query = name_terms.join(" ");
@@ -565,7 +758,7 @@ pub fn search_with_date_range(
             && personal.is_none_or(|m| m.get(*id).copied().unwrap_or(false))
             && date_matches(index.modified(*id), since, until)
     });
-    sort_hits(index, &name_query, limit, category, order, hits)
+    (name_query, hits)
 }
 
 fn date_matches(value: Option<i64>, since: Option<i64>, until: Option<i64>) -> bool {
@@ -603,35 +796,7 @@ fn sort_hits(
         let mut ranked: Vec<_> = results
             .into_iter()
             .map(|id| {
-                let name = index.name(id);
-                let stem = name.strip_suffix(".app").unwrap_or(name);
-                let normalized = || {
-                    stem.bytes()
-                        .filter(|b| !b.is_ascii_whitespace())
-                        .map(|b| b.to_ascii_lowercase())
-                };
-                let quality = if normalized().eq(query.iter().copied()) {
-                    0
-                } else if normalized().take(query.len()).eq(query.iter().copied()) {
-                    1
-                } else {
-                    2
-                };
-                let app_tier = if category == Category::Application && name.ends_with(".app") {
-                    let path = index.path(id);
-                    if path.contains(".app/") {
-                        3
-                    } else if path.starts_with("/private/var/") || path.starts_with("/tmp/") {
-                        4
-                    } else if path.starts_with("/Applications/") || path.contains("/Applications/")
-                    {
-                        0
-                    } else {
-                        1
-                    }
-                } else {
-                    0
-                };
+                let (app_tier, quality) = rank_key(index, id, &query, category);
                 (id, app_tier, quality)
             })
             .collect();
@@ -672,6 +837,186 @@ fn sort_hits(
     }
     results.sort_unstable_by(compare);
     results
+}
+
+fn rank_key(index: &CompactIndex, id: usize, query: &[u8], category: Category) -> (u8, u8) {
+    let name = index.name(id);
+    let stem = name.strip_suffix(".app").unwrap_or(name);
+    let normalized = || {
+        stem.bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .map(|b| b.to_ascii_lowercase())
+    };
+    let quality = if normalized().eq(query.iter().copied()) {
+        0
+    } else if normalized().take(query.len()).eq(query.iter().copied()) {
+        1
+    } else {
+        2
+    };
+    let app_tier = if category == Category::Application && name.ends_with(".app") {
+        let path = index.path(id);
+        if path.contains(".app/") {
+            3
+        } else if path.starts_with("/private/var/") || path.starts_with("/tmp/") {
+            4
+        } else if path.starts_with("/Applications/") || path.contains("/Applications/") {
+            0
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+    (app_tier, quality)
+}
+
+/// A query snapshot contains only matching IDs and their sorting keys, never the full index.
+/// Each page partitions the cached matches and sorts just its requested window.
+pub struct SearchSession {
+    keys: PageKeys,
+    order: SortOrder,
+}
+struct NameKey {
+    id: u32,
+    offset: u32,
+    len: u16,
+    tier: u8,
+    quality: u8,
+}
+enum PageKeys {
+    Names {
+        keys: Vec<NameKey>,
+        names: NameStore,
+    },
+    Dates(Vec<(u32, i64)>),
+}
+impl SearchSession {
+    pub fn new(
+        index: &CompactIndex,
+        query: &str,
+        category: Category,
+        order: SortOrder,
+        include_paths: bool,
+        personal: Option<&[bool]>,
+        since: Option<i64>,
+        until: Option<i64>,
+        raster: bool,
+    ) -> Self {
+        let (name_query, hits) = matching_hits(
+            index,
+            query,
+            category,
+            include_paths,
+            personal,
+            since,
+            until,
+            raster,
+        );
+        let keys = if matches!(order, SortOrder::Latest | SortOrder::Oldest) {
+            PageKeys::Dates(
+                hits.into_iter()
+                    .map(|id| (id as u32, index.modified(id).unwrap_or(UNKNOWN_DATE)))
+                    .collect(),
+            )
+        } else {
+            let query: Vec<u8> = name_query
+                .bytes()
+                .filter(|b| !b.is_ascii_whitespace())
+                .map(|b| b.to_ascii_lowercase())
+                .collect();
+            let keys = hits
+                .into_iter()
+                .map(|id| {
+                    let record = index.records[id];
+                    let (tier, quality) = if order == SortOrder::Relevance {
+                        rank_key(index, id, &query, category)
+                    } else {
+                        (0, 0)
+                    };
+                    let key = NameKey {
+                        id: id as u32,
+                        offset: record.name_start,
+                        len: record.name_len,
+                        tier,
+                        quality,
+                    };
+                    key
+                })
+                .collect();
+            PageKeys::Names {
+                keys,
+                names: index.names.clone(),
+            }
+        };
+        Self { keys, order }
+    }
+    pub fn total(&self) -> usize {
+        match &self.keys {
+            PageKeys::Names { keys, .. } => keys.len(),
+            PageKeys::Dates(keys) => keys.len(),
+        }
+    }
+    pub fn page(&mut self, page: usize, size: usize) -> Vec<usize> {
+        let start = page.saturating_mul(size);
+        if size == 0 || start >= self.total() {
+            return Vec::new();
+        }
+        match &mut self.keys {
+            PageKeys::Names { keys, names } => {
+                let compare = |a: &NameKey, b: &NameKey| {
+                    (a.tier, a.quality)
+                        .cmp(&(b.tier, b.quality))
+                        .then_with(|| {
+                            let name =
+                                |key: &NameKey| names.slice(key.offset as usize, key.len as usize);
+                            name(a).cmp(name(b))
+                        })
+                        .then_with(|| a.id.cmp(&b.id))
+                };
+                window(keys, start, size, compare)
+                    .iter()
+                    .map(|k| k.id as usize)
+                    .collect()
+            }
+            PageKeys::Dates(keys) => {
+                let order = self.order;
+                let compare = |a: &(u32, i64), b: &(u32, i64)| {
+                    (a.1 == UNKNOWN_DATE)
+                        .cmp(&(b.1 == UNKNOWN_DATE))
+                        .then_with(|| {
+                            if order == SortOrder::Latest {
+                                b.1.cmp(&a.1)
+                            } else {
+                                a.1.cmp(&b.1)
+                            }
+                        })
+                        .then_with(|| a.0.cmp(&b.0))
+                };
+                window(keys, start, size, compare)
+                    .iter()
+                    .map(|k| k.0 as usize)
+                    .collect()
+            }
+        }
+    }
+}
+fn window<T, F: Fn(&T, &T) -> std::cmp::Ordering + Copy>(
+    keys: &mut [T],
+    start: usize,
+    size: usize,
+    compare: F,
+) -> &mut [T] {
+    if start > 0 {
+        keys.select_nth_unstable_by(start, compare);
+    }
+    let tail = &mut keys[start..];
+    let len = size.min(tail.len());
+    if len < tail.len() {
+        tail.select_nth_unstable_by(len, compare);
+    }
+    tail[..len].sort_unstable_by(compare);
+    &mut tail[..len]
 }
 
 pub fn warm_up_parallel_search() {
@@ -785,7 +1130,7 @@ fn migrate_legacy() -> Result<CompactIndex, String> {
             Ok(FlatEntry {
                 path: row.get::<_, String>(0)?.into_boxed_str(),
                 is_dir: row.get::<_, i64>(1)? != 0,
-                modified: UNKNOWN_DATE,
+                modified: UNCACHED_DATE,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -825,8 +1170,9 @@ fn save_compact(index: &CompactIndex) -> Result<(), String> {
             .and_then(|_| writer.write_all(&[record.flags, 0]))
             .map_err(|error| error.to_string())?;
     }
-    writer
-        .write_all(&index.names)
+    index
+        .names
+        .write_to(&mut writer)
         .map_err(|error| error.to_string())?;
     writer.flush().map_err(|error| error.to_string())?;
     fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
@@ -871,7 +1217,10 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
     if count > u32::MAX as usize || names_len > u32::MAX as usize {
         return Err("索引数据超过当前版本支持范围".to_owned());
     }
-    let mut records = Vec::with_capacity(count);
+    // Leave modest headroom for incremental updates. The first filesystem
+    // event should not force a reallocation of the full loaded tables.
+    let capacity = count + (count / 128).min(32_768);
+    let mut records = Vec::with_capacity(capacity);
     for _ in 0..count {
         let parent = read_u32(&mut reader)?;
         let name_start = read_u32(&mut reader)?;
@@ -885,15 +1234,37 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
             name_start,
             name_len,
             flags: flags[0],
-            modified: UNKNOWN_DATE,
+            modified: UNCACHED_DATE,
         });
     }
-    let mut names = vec![0; names_len];
-    reader
-        .read_exact(&mut names)
+    let names_offset = reader.stream_position().map_err(|e| e.to_string())?;
+    let file_len = reader
+        .get_ref()
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .len();
+    if file_len < names_offset + names_len as u64 {
+        return Err("索引名称表不完整".into());
+    }
+    let names = if names_len == 0 {
+        NameStore::default()
+    } else {
+        // save_compact replaces the index by rename. An active mapping keeps
+        // its immutable inode, while newly indexed names go into writable tails.
+        let mapped = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(names_offset)
+                .len(names_len)
+                .map(reader.get_ref())
+        }
         .map_err(|error| error.to_string())?;
-    std::str::from_utf8(&names).map_err(|error| error.to_string())?;
-    let mut path_hashes = Vec::with_capacity(count);
+        std::str::from_utf8(&mapped).map_err(|e| e.to_string())?;
+        NameStore {
+            base: Arc::new(BaseNames::Mapped(mapped)),
+            tails: Vec::new(),
+        }
+    };
+    let mut path_hashes = Vec::with_capacity(capacity);
     for (index, record) in records.iter().enumerate() {
         let start = record.name_start as usize;
         let end = start + record.name_len as usize;
@@ -1387,7 +1758,7 @@ pub fn search_filtered_with_scope(
     results
 }
 
-fn hash_path(path: &str) -> u64 {
+pub fn hash_path(path: &str) -> u64 {
     hash_bytes(path.as_bytes())
 }
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -1660,6 +2031,38 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn aligned_cache_skips_stat_even_for_unavailable_dates_and_partial_cache_repairs_only_gaps() {
+        let dir = temp_dir();
+        let cache = dir.join("dates.bin");
+        let mut original = sample();
+        original.records[2].modified = 1234;
+        super::save_dates_to(&original, &cache).unwrap();
+        let mut loaded = sample();
+        loaded.dates_ready = false;
+        super::load_dates(&mut loaded, &cache).unwrap();
+        assert!(loaded.dates_ready());
+        assert!(loaded.missing_date_batch(&mut 0).is_empty());
+        assert_eq!(loaded.modified(2), Some(1234));
+        // A valid cache for a slightly older index still covers all but the last record.
+        let n = loaded.len();
+        let mut partial = std::fs::read(&cache).unwrap();
+        partial[8..16].copy_from_slice(&((n - 1) as u64).to_le_bytes());
+        partial.truncate(partial.len() - 16);
+        std::fs::write(&cache, partial).unwrap();
+        super::load_dates(&mut loaded, &cache).unwrap();
+        assert!(!loaded.dates_ready());
+        let mut cursor = 0;
+        assert_eq!(
+            loaded.missing_date_batch(&mut cursor),
+            vec![(n - 1, loaded.path(n - 1))]
+        );
+        loaded.apply_date_batch(vec![(n - 1, 5678)]);
+        assert!(loaded.missing_date_batch(&mut cursor).is_empty());
+        assert_eq!(loaded.modified(n - 1), Some(5678));
+        assert_eq!(loaded.modified(2), Some(1234));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn filesystem_modified_time_and_concurrent_updates_are_preserved() {
         let dir = temp_dir();
         let file = dir.join("test.md");
@@ -1673,12 +2076,11 @@ mod tests {
         let entry = super::make_flat(&file, Some(false)).unwrap();
         assert_eq!(entry.modified, 123456000);
         let mut index = sample();
-        let hash = index.path_hashes[2];
         index.records[2].modified = 200;
-        index.apply_dates(vec![(hash, UNKNOWN_DATE, 100)]);
+        index.apply_date_batch(vec![(2, 100)]);
         assert_eq!(index.modified(2), Some(200));
-        index.records[2].modified = UNKNOWN_DATE;
-        index.apply_dates(vec![(hash, UNKNOWN_DATE, 100)]);
+        index.records[2].modified = super::UNCACHED_DATE;
+        index.apply_date_batch(vec![(2, 100)]);
         assert_eq!(index.modified(2), Some(100));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1902,5 +2304,177 @@ mod personal_tests {
             .len(),
             5
         );
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+    fn fixture() -> CompactIndex {
+        let mut flat = vec![FlatEntry {
+            path: "/tmp".into(),
+            is_dir: true,
+            modified: UNKNOWN_DATE,
+        }];
+        for i in 0..1733 {
+            flat.push(FlatEntry {
+                path: format!(
+                    "/tmp/item-{:04}.{}",
+                    (i * 37) % 1733,
+                    if i % 3 == 0 { "png" } else { "md" }
+                )
+                .into(),
+                is_dir: false,
+                modified: if i % 17 == 0 {
+                    UNKNOWN_DATE
+                } else {
+                    (i % 100) as i64
+                },
+            });
+        }
+        let mut index = CompactIndex::from_flat(vec!["/tmp".into()], flat).unwrap();
+        index.dates_ready = true;
+        index
+    }
+    #[test]
+    fn pages_match_global_sort_and_arbitrary_jumps_without_duplicates() {
+        let index = fixture();
+        for order in [
+            SortOrder::Relevance,
+            SortOrder::Name,
+            SortOrder::Latest,
+            SortOrder::Oldest,
+        ] {
+            let expected = search_with_date_range(
+                &index,
+                "item",
+                usize::MAX,
+                Category::All,
+                order,
+                false,
+                None,
+                None,
+                None,
+                false,
+            );
+            let mut session = SearchSession::new(
+                &index,
+                "item",
+                Category::All,
+                order,
+                false,
+                None,
+                None,
+                None,
+                false,
+            );
+            assert_eq!(session.total(), 1733);
+            for page in [3, 0, 2, 1, 3, 1, 0] {
+                assert_eq!(
+                    session.page(page, 500),
+                    expected[page * 500..expected.len().min((page + 1) * 500)]
+                );
+            }
+            let actual: Vec<_> = (0..4).flat_map(|p| session.page(p, 500)).collect();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.iter().copied().collect::<HashSet<_>>().len(), 1733);
+            assert!(session.page(4, 500).is_empty());
+            assert!(session.page(usize::MAX, 500).is_empty());
+            assert!(session.page(0, 0).is_empty());
+        }
+    }
+    #[test]
+    fn filters_apply_before_paging_and_explicit_empty_type_browses() {
+        let index = fixture();
+        let mask: Vec<_> = (0..index.records.len()).map(|id| id % 2 == 0).collect();
+        let order = SortOrder::Latest;
+        let expected = search_with_date_range(
+            &index,
+            "/tmp item",
+            usize::MAX,
+            Category::Image,
+            order,
+            false,
+            Some(&mask),
+            Some(10),
+            Some(80),
+            true,
+        );
+        let mut session = SearchSession::new(
+            &index,
+            "/tmp item",
+            Category::Image,
+            order,
+            false,
+            Some(&mask),
+            Some(10),
+            Some(80),
+            true,
+        );
+        assert_eq!(session.total(), expected.len());
+        assert_eq!(session.page(0, 500), expected);
+        let mut session = SearchSession::new(
+            &index,
+            "",
+            Category::Image,
+            order,
+            false,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(session.total(), 578);
+        assert_eq!(session.page(1, 500).len(), 78);
+        assert_eq!(
+            SearchSession::new(
+                &index,
+                "",
+                Category::All,
+                order,
+                false,
+                None,
+                None,
+                None,
+                false
+            )
+            .total(),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod name_snapshot_tests {
+    use super::*;
+    #[test]
+    fn shared_names_survive_appends_chunk_boundaries_and_flat_persistence() {
+        let mut names = NameStore::from(b"base".to_vec());
+        let base = names.clone();
+        names.prepare_name(3);
+        let one = names.len();
+        names.extend_from_slice(b"one");
+        let frozen = names.clone();
+        names.prepare_name(3);
+        names.extend_from_slice(b"two");
+        assert_eq!(base.len(), 4);
+        assert_eq!(frozen.len(), 7);
+        assert_eq!(frozen.slice(one, 3), b"one");
+        let filler = vec![b'x'; NAME_CHUNK - 8];
+        names.prepare_name(filler.len());
+        names.extend_from_slice(&filler);
+        assert_eq!(names.len(), 4 + NAME_CHUNK - 2);
+        names.prepare_name(3);
+        let next = names.len();
+        names.extend_from_slice(b"end");
+        assert_eq!(next, 4 + NAME_CHUNK);
+        assert_eq!(names.slice(next, 3), b"end");
+        assert_eq!(frozen.slice(one, 3), b"one");
+        let mut bytes = Vec::new();
+        names.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), names.len());
+        let loaded = NameStore::from(bytes);
+        assert_eq!(loaded.slice(one, 3), b"one");
+        assert_eq!(loaded.slice(next, 3), b"end");
     }
 }

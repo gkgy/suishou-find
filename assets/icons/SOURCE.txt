@@ -1,0 +1,1 @@
+Tabler Icons 3.49.0, @tabler/icons-png official npm package. MIT. Source https://github.com/tabler/tabler-icons . Outline PNGs; RGB normalized white, alpha preserved for runtime tint.

@@ -1,6 +1,6 @@
 [package]
 name = "miao-find"
-version = "0.5.3"
+version = "0.5.7"
 edition = "2024"
 description = "A fast filename search app for macOS"
 license = "MIT"
@@ -12,6 +12,7 @@ eframe = { version = "0.36.1", default-features = false, features = ["accesskit"
 global-hotkey = "0.8.0"
 ignore = "0.4.23"
 libc = "0.2.189"
+memmap2 = "0.9.11"
 notify = "8.2.0"
 rayon = "1.12.0"
 rfd = "0.17.2"
@@ -25,3 +26,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+epaint = { path = "vendor/epaint" }
+
+[build-dependencies]
+cc = "1"
