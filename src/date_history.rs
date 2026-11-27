@@ -1,7 +1,7 @@
-// Check the dates of existing records changed between launches, using the
-// host FSEvents journal. The GUI can search the cached dates during replay.
+// Replay the historical part of FSEvents between launches. Keep structural events
+// in the regular delta journal before advancing past an incomplete replay.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_char, c_void},
     fs, io,
     path::{Path, PathBuf},
@@ -16,37 +16,72 @@ unsafe extern "C" {
         since: u64,
         roots: *const *const c_char,
         count: usize,
-        sink: extern "C" fn(*mut c_void, *const c_char) -> bool,
+        sink: extern "C" fn(*mut c_void, *const c_char, bool) -> bool,
         state: *mut c_void,
     ) -> bool;
 }
 
-type Updates = HashMap<u64, Option<i64>>;
-
-extern "C" fn collect(state: *mut c_void, path: *const c_char) -> bool {
+#[derive(Default)]
+struct Changes {
+    roots: Vec<PathBuf>,
+    dates: HashMap<u64, Option<i64>>,
+    structural: HashSet<PathBuf>,
+}
+extern "C" fn collect(state: *mut c_void, path: *const c_char, structural: bool) -> bool {
     // C calls this synchronously on the worker thread with a NUL-terminated path.
-    let updates = unsafe { &mut *state.cast::<Updates>() };
+    let changes = unsafe { &mut *state.cast::<Changes>() };
     let Ok(path) = unsafe { CStr::from_ptr(path) }.to_str() else {
         return true;
     };
     let hash = index::hash_path(path);
-    if !updates.contains_key(&hash) {
-        // Keep a gap or an unusually large offline backlog from consuming
-        // unbounded memory. A manual rebuild can reconcile an expired journal.
-        if updates.len() >= 250_000 {
+    let path = Path::new(path);
+    if !index::sync_path(path, &changes.roots) {
+        return true;
+    }
+    if !changes.dates.contains_key(&hash) {
+        if changes.dates.len() >= 250_000 {
             return false;
         }
-        updates.insert(hash, index::file_date(Path::new(path)));
+        changes.dates.insert(hash, index::file_date(path));
+    }
+    if structural && !changes.roots.iter().any(|r| r == path) {
+        changes.structural.insert(path.to_owned());
     }
     true
 }
 
+#[derive(Default)]
+struct Cursor {
+    id: u64,
+    gap: bool,
+}
+impl Cursor {
+    fn load(path: &Path) -> io::Result<Self> {
+        let text = fs::read_to_string(path)?;
+        let mut fields = text.split_whitespace();
+        let id = fields
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or(io::ErrorKind::InvalidData)?;
+        Ok(Self {
+            id,
+            gap: fields.next() == Some("gap"),
+        })
+    }
+    fn write(&self, path: &Path) -> io::Result<()> {
+        let temp = path.with_extension("tmp");
+        let gap = if self.gap { " gap" } else { "" };
+        fs::write(&temp, format!("{}{gap}", self.id))?;
+        fs::rename(temp, path)
+    }
+}
+
 pub struct History {
     cursor_file: PathBuf,
-    start: u64,
-    receiver: Option<Receiver<(Updates, bool)>>,
-    complete: bool,
+    boundary: Cursor,
+    receiver: Option<Receiver<(Changes, bool)>>,
     original_records: usize,
+    settled: bool,
 }
 
 impl History {
@@ -54,62 +89,78 @@ impl History {
         if index.is_empty() {
             return None;
         }
-        let cursor_file = index::compact_index_path()
-            .ok()?
-            .with_file_name("dates-fsevents-v1");
-        let start = unsafe { FSEventsGetCurrentEventId() };
-        let since = match fs::read_to_string(&cursor_file) {
-            Ok(text) => Some(text.trim().parse::<u64>().unwrap_or(u64::MAX)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => Some(u64::MAX),
+        let mut history = Self::after_rebuild(index)?;
+        let since = match Cursor::load(&history.cursor_file) {
+            Ok(cursor) => cursor,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(history),
+            Err(_) => Cursor {
+                id: u64::MAX,
+                gap: true,
+            },
         };
-        let mut history = Self {
-            cursor_file,
-            start,
-            receiver: None,
-            complete: true,
-            original_records: index.record_count(),
-        };
-        if let Some(since) = since.filter(|id| *id != start) {
+        history.boundary.gap = since.gap;
+        if since.id != history.boundary.id {
             let roots = index.roots().to_vec();
             let (sender, receiver) = mpsc::channel();
             history.receiver = Some(receiver);
-            history.complete = false;
+            history.settled = false;
             std::thread::spawn(move || {
                 let names: Vec<_> = roots
                     .iter()
                     .filter_map(|p| CString::new(p.as_os_str().as_encoded_bytes()).ok())
                     .collect();
                 let pointers: Vec<_> = names.iter().map(|p| p.as_ptr()).collect();
-                let mut updates = Updates::new();
+                let mut changes = Changes {
+                    roots,
+                    ..Default::default()
+                };
                 let complete = unsafe {
                     miao_replay_history(
-                        since,
+                        since.id,
                         pointers.as_ptr(),
                         pointers.len(),
                         collect,
-                        (&mut updates as *mut Updates).cast(),
+                        (&mut changes as *mut Changes).cast(),
                     )
                 };
-                let _ = sender.send((updates, complete));
+                let _ = sender.send((changes, complete));
                 repaint.request_repaint();
             });
         }
         Some(history)
     }
 
-    pub fn poll(&mut self, index: &mut CompactIndex) -> Option<bool> {
-        let result = self.receiver.as_ref()?.try_recv();
-        match result {
-            Ok((updates, complete)) => {
-                index.apply_historical_dates(self.original_records, &updates);
-                self.complete = complete;
-            }
+    pub fn has_gap(&self) -> bool {
+        self.boundary.gap
+    }
+
+    pub fn poll(&mut self, index: &mut CompactIndex) -> Option<Result<bool, String>> {
+        let (changes, complete) = match self.receiver.as_ref()?.try_recv() {
+            Ok(result) => result,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => self.complete = false,
-        }
+            Err(TryRecvError::Disconnected) => (Changes::default(), false),
+        };
         self.receiver = None;
-        Some(self.complete)
+        let paths = index::dedup_paths(changes.structural.into_iter().collect());
+        if !paths.is_empty()
+            && let Err(e) = index::write_journal(
+                &self.cursor_file.with_file_name(index::JOURNAL_NAME),
+                &paths,
+            )
+        {
+            return Some(Err(e));
+        }
+        index.apply_historical_dates(self.original_records, &changes.dates);
+        self.settled = true;
+        if !complete {
+            // The missed interval requires a rebuild. Persist both the warning and a
+            // new boundary now, even if this launch never gets a graceful shutdown.
+            self.boundary.gap = true;
+            if let Err(e) = self.checkpoint() {
+                return Some(Err(e.to_string()));
+            }
+        }
+        Some(Ok(!paths.is_empty()))
     }
 
     pub fn after_rebuild(index: &CompactIndex) -> Option<Self> {
@@ -117,21 +168,91 @@ impl History {
             cursor_file: index::compact_index_path()
                 .ok()?
                 .with_file_name("dates-fsevents-v1"),
-            start: unsafe { FSEventsGetCurrentEventId() },
+            boundary: Cursor {
+                id: unsafe { FSEventsGetCurrentEventId() },
+                gap: false,
+            },
             receiver: None,
-            complete: true,
+            settled: true,
             original_records: index.record_count(),
         })
     }
 
     pub fn checkpoint(&self) -> io::Result<()> {
-        if self.complete {
-            // Save the launch boundary only after the paired index and dates
-            // are on disk. An interrupted session can safely replay events again.
-            let temp = self.cursor_file.with_extension("tmp");
-            fs::write(&temp, self.start.to_string())?;
-            fs::rename(temp, &self.cursor_file)?;
+        if self.settled {
+            self.boundary.write(&self.cursor_file)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cutoff_advances_old_cursor_and_keeps_gap_until_rebuild() {
+        let dir = std::env::temp_dir().join(format!("suishou-cursor-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cursor_file = dir.join("dates-fsevents-v1");
+        fs::write(&cursor_file, "173566105").unwrap();
+        assert!(!Cursor::load(&cursor_file).unwrap().gap);
+        let (tx, rx) = mpsc::channel();
+        let mut history = History {
+            cursor_file: cursor_file.clone(),
+            boundary: Cursor {
+                id: 281380420,
+                gap: false,
+            },
+            receiver: Some(rx),
+            original_records: 0,
+            settled: false,
+        };
+        history.checkpoint().unwrap();
+        assert_eq!(Cursor::load(&cursor_file).unwrap().id, 173566105);
+        let changes = Changes {
+            structural: HashSet::from([dir.join("books/test.epub")]),
+            ..Default::default()
+        };
+        tx.send((changes, false)).unwrap();
+        assert!(history.poll(&mut CompactIndex::default()).unwrap().unwrap());
+        assert!(dir.join(index::JOURNAL_NAME).metadata().unwrap().len() > 0);
+        let persisted = Cursor::load(&cursor_file).unwrap();
+        assert_eq!(persisted.id, 281380420);
+        assert!(persisted.gap);
+        let (tx, rx) = mpsc::channel();
+        history.receiver = Some(rx);
+        history.boundary.id += 100;
+        tx.send((Changes::default(), true)).unwrap();
+        history.poll(&mut CompactIndex::default()).unwrap().unwrap();
+        // Successful replay advances only after its matching snapshot is durable.
+        assert_eq!(Cursor::load(&cursor_file).unwrap().id, 281380420);
+        history.checkpoint().unwrap();
+        assert!(Cursor::load(&cursor_file).unwrap().gap);
+        history.boundary.gap = false;
+        history.checkpoint().unwrap();
+        assert!(!Cursor::load(&cursor_file).unwrap().gap);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn historical_structural_events_survive_metadata_duplicates_and_skip_noise() {
+        let mut changes = Changes {
+            roots: vec!["/Users/sample".into()],
+            ..Default::default()
+        };
+        let state = (&mut changes as *mut Changes).cast();
+        let file = c"/Users/sample/orca/offline.epub";
+        assert!(collect(state, file.as_ptr(), false));
+        assert!(collect(state, file.as_ptr(), true));
+        assert!(collect(
+            state,
+            c"/Users/sample/Library/Caches/noisy".as_ptr(),
+            true
+        ));
+        assert_eq!(changes.dates.len(), 1);
+        assert_eq!(
+            changes.structural,
+            HashSet::from([PathBuf::from(file.to_str().unwrap())])
+        );
     }
 }

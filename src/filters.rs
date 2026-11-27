@@ -126,6 +126,8 @@ impl SavedFilter {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Preferences {
     #[serde(default)]
+    preferences_version: u32,
+    #[serde(default)]
     pub english: bool,
     #[serde(default = "default_preview_visible")]
     pub preview_visible: bool,
@@ -141,35 +143,78 @@ pub struct Preferences {
 fn default_preview_visible() -> bool {
     true
 }
+const PREFERENCES_VERSION: u32 = 1;
+
 impl Default for Preferences {
     fn default() -> Self {
+        let roots = default_roots();
         Self {
+            preferences_version: PREFERENCES_VERSION,
             english: false,
             preview_visible: true,
             shortcut: crate::shortcut::Shortcut::default(),
-            personal_roots: default_roots(),
-            scope_locations: default_roots(),
+            personal_roots: roots.clone(),
+            scope_locations: roots,
             saved: Vec::new(),
             exclusions: miao_find::index::default_personal_exclusions(),
         }
     }
 }
+
+fn legacy_roots() -> Vec<PathBuf> {
+    directories::BaseDirs::new()
+        .into_iter()
+        .flat_map(|dirs| {
+            [
+                "Desktop",
+                "Documents",
+                "Downloads",
+                "Pictures",
+                "Movies",
+                "Music",
+                "AI",
+            ]
+            .map(|name| dirs.home_dir().join(name))
+        })
+        .collect()
+}
+
 pub fn default_roots() -> Vec<PathBuf> {
-    let home = directories::BaseDirs::new()
-        .map(|d| d.home_dir().to_owned())
-        .unwrap_or_default();
-    [
-        "Desktop",
-        "Documents",
-        "Downloads",
-        "Pictures",
-        "Movies",
-        "Music",
-        "AI",
-    ]
-    .into_iter()
-    .map(|name| home.join(name))
-    .collect()
+    let mut roots: Vec<_> = directories::BaseDirs::new()
+        .into_iter()
+        .map(|dirs| dirs.home_dir().to_owned())
+        .collect();
+    roots.push(PathBuf::from("/Applications"));
+    roots.extend(miao_find::index::local_external_volumes());
+    roots
+}
+
+impl Preferences {
+    pub fn refresh_locations(&mut self) {
+        let defaults = default_roots();
+        let legacy = legacy_roots();
+        if self.preferences_version < PREFERENCES_VERSION {
+            if !legacy.is_empty()
+                && self.personal_roots.len() == legacy.len()
+                && legacy.iter().all(|root| self.personal_roots.contains(root))
+            {
+                self.personal_roots.clone_from(&defaults);
+            }
+            if !self.exclusions.iter().any(|name| name == "Caches") {
+                self.exclusions.push("Caches".into());
+            }
+            self.preferences_version = PREFERENCES_VERSION;
+        }
+        for root in defaults
+            .into_iter()
+            .chain(legacy)
+            .chain(self.personal_roots.iter().cloned())
+        {
+            if !self.scope_locations.contains(&root) {
+                self.scope_locations.push(root);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -296,6 +341,53 @@ mod tests {
             self.0.remove(key);
         }
         fn flush(&mut self) {}
+    }
+    #[test]
+    fn legacy_ron_migrates_defaults_once_and_preserves_customizations() {
+        use super::*;
+        let mut store = Store::default();
+        let mut old = legacy_roots();
+        old.reverse();
+        let custom = PathBuf::from("/custom/project");
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_owned();
+        for selection in [old.clone(), Vec::new(), vec![custom.clone()]] {
+            // Same serialized value eframe retrieves from search_preferences_v1 in app.ron.
+            let text = format!(
+                r#"(english:true,personal_roots:{selection:?},scope_locations:["/custom/project"],saved:[],exclusions:["MyCache"])"#
+            );
+            eframe::Storage::set_string(&mut store, "search_preferences_v1", text);
+            let mut prefs: Preferences =
+                eframe::get_value(&store, "search_preferences_v1").unwrap();
+            prefs.refresh_locations();
+            assert!(prefs.english && prefs.scope_locations.contains(&custom));
+            assert!(prefs.scope_locations.contains(&home));
+            assert!(
+                prefs
+                    .scope_locations
+                    .contains(&PathBuf::from("/Applications"))
+            );
+            for vol in miao_find::index::local_external_volumes() {
+                assert!(prefs.scope_locations.contains(&vol));
+            }
+            assert_eq!(
+                prefs.personal_roots,
+                if selection == old {
+                    default_roots()
+                } else {
+                    selection
+                }
+            );
+            assert_eq!(prefs.exclusions, ["MyCache", "Caches"]);
+            prefs.exclusions.pop();
+            prefs.personal_roots.clear();
+            eframe::set_value(&mut store, "search_preferences_v1", &prefs);
+            let mut restored: Preferences =
+                eframe::get_value(&store, "search_preferences_v1").unwrap();
+            restored.refresh_locations();
+            assert!(restored.personal_roots.is_empty());
+            assert_eq!(restored.exclusions, ["MyCache"]);
+            assert_eq!(restored.scope_locations, prefs.scope_locations);
+        }
     }
     #[test]
     fn ranges_use_milliseconds_and_validate_calendar() {

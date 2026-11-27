@@ -14,6 +14,9 @@ pub fn tr(text: &str) -> &str {
 }
 fn translate(text: &str) -> &str {
     match text {
+        "离线变更历史不完整，请重新建立索引" => {
+            "Offline changes incomplete. Rebuild the index."
+        }
         "随手找" => "Everywhere",
         "请选择一个文件夹建立索引" => "Choose a folder to create an index",
         "已载入 {count} 个文件和文件夹" => "Loaded {count} files and folders",
@@ -40,6 +43,7 @@ fn translate(text: &str) -> &str {
         "已选择 {} 个目录" => "{} folders selected",
         "全不选" => "Deselect All",
         "全选" => "Select All",
+        "个人主目录 (~)" => "Home folder (~)",
         "桌面" => "Desktop",
         "文稿" => "Documents",
         "下载" => "Downloads",
@@ -48,8 +52,8 @@ fn translate(text: &str) -> &str {
         "音乐" => "Music",
         "添加其他目录…" => "Add Other Folder…",
         "高级：排除规则" => "Advanced: Exclusions",
-        "每行一个目录名。.* 排除隐藏目录，*.app 排除应用包。" => {
-            "One folder name per line. .* excludes hidden folders; *.app excludes app bundles."
+        "每行一个目录名。.* 排除隐藏目录，*.app 隐藏应用包内部文件，保留应用名称。" => {
+            "One folder name per line. .* excludes hidden folders; *.app hides bundle contents and keeps app names searchable."
         }
         "只筛选已经建立索引的位置。取消或关闭不会改变当前搜索范围。" => {
             "Only indexed locations are searched. Cancel or close to keep your current selection."

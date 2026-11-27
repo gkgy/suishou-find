@@ -3,12 +3,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef bool (*PathSink)(void *, const char *);
+typedef bool (*PathSink)(void *, const char *, bool);
 typedef struct {
     void *sink_context;
     PathSink sink;
     bool done;
     bool gap;
+    double deadline;
 } Replay;
 
 static void receive_history(ConstFSEventStreamRef stream, void *context, size_t count,
@@ -22,13 +23,19 @@ static void receive_history(ConstFSEventStreamRef stream, void *context, size_t 
         if (flags[i] & (kFSEventStreamEventFlagMustScanSubDirs |
                         kFSEventStreamEventFlagEventIdsWrapped)) {
             replay->gap = true;
+            replay->done = true;
+            break;
         }
         if (flags[i] & kFSEventStreamEventFlagHistoryDone) {
             replay->done = true;
         } else if ((flags[i] & (kFSEventStreamEventFlagItemIsFile |
                                 kFSEventStreamEventFlagItemIsDir |
                                 kFSEventStreamEventFlagItemIsSymlink)) &&
-                   !replay->sink(replay->sink_context, paths[i])) {
+                   (CFAbsoluteTimeGetCurrent() >= replay->deadline ||
+                    !replay->sink(replay->sink_context, paths[i],
+                        (flags[i] & (kFSEventStreamEventFlagItemCreated |
+                                     kFSEventStreamEventFlagItemRemoved |
+                                     kFSEventStreamEventFlagItemRenamed)) != 0))) {
             replay->gap = true;
             replay->done = true;
         }
@@ -46,7 +53,7 @@ bool miao_replay_history(uint64_t since, const char *const *roots, size_t count,
             CFRelease(path);
         }
     }
-    Replay replay = {sink_context, sink, false, false};
+    Replay replay = {sink_context, sink, false, false, CFAbsoluteTimeGetCurrent() + 45};
     FSEventStreamContext context = {0, &replay, NULL, NULL, NULL};
     FSEventStreamRef stream = FSEventStreamCreate(NULL, receive_history, &context, paths,
         since, 0.1, kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer);
@@ -58,8 +65,7 @@ bool miao_replay_history(uint64_t since, const char *const *roots, size_t count,
     FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
 #pragma clang diagnostic pop
     if (FSEventStreamStart(stream)) {
-        double deadline = CFAbsoluteTimeGetCurrent() + 45;
-        while (!replay.done && CFAbsoluteTimeGetCurrent() < deadline) {
+        while (!replay.done && CFAbsoluteTimeGetCurrent() < replay.deadline) {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, true);
         }
         FSEventStreamStop(stream);

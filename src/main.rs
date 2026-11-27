@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     process::Command,
     sync::{
@@ -8,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{self, Color32, RichText};
@@ -48,6 +49,20 @@ fn main() -> eframe::Result {
     )
 }
 
+type DeltaBatch = Result<(IndexDelta, u64), String>;
+
+#[derive(Default)]
+struct BackgroundSync {
+    receiver: Option<Receiver<DeltaBatch>>,
+    pending: HashSet<PathBuf>,
+    next_batch: Option<Instant>,
+    replay_journal: bool,
+    applied_end: u64,
+    flush_at: Option<Instant>,
+    checkpoint: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+const FLUSH_INTERVAL: Duration = Duration::from_secs(120);
+
 struct MiaoFindApp {
     preferences: Preferences,
     personal_mask: Vec<bool>,
@@ -70,7 +85,7 @@ struct MiaoFindApp {
     save_editor: bool,
     manage_filters: bool,
     bookmark_name: String,
-    index: CompactIndex,
+    index: Arc<CompactIndex>,
     results: Vec<usize>,
     paging: paging::Paging,
     selected_result: Option<usize>,
@@ -93,10 +108,7 @@ struct MiaoFindApp {
     scan_receiver: Option<Receiver<ScanMessage>>,
     watcher: Option<RecommendedWatcher>,
     watch_receiver: Option<Receiver<notify::Result<notify::Event>>>,
-    update_receiver: Option<Receiver<Result<IndexDelta, String>>>,
-    pending_paths: Vec<PathBuf>,
-    last_watch_event: Option<Instant>,
-    watcher_started: Option<Instant>,
+    sync: BackgroundSync,
     query_ms: f64,
     hotkey: Option<shortcut::Controller>,
     shortcut_editor: bool,
@@ -139,7 +151,7 @@ impl MiaoFindApp {
                     save_editor: false,
                     manage_filters: false,
                     bookmark_name: String::new(),
-                    index,
+                    index: Arc::new(index),
                     results: Vec::new(),
                     paging: paging::Paging::new(context.egui_ctx.clone()),
                     selected_result: None,
@@ -169,10 +181,7 @@ impl MiaoFindApp {
                     scan_receiver: None,
                     watcher: None,
                     watch_receiver: None,
-                    update_receiver: None,
-                    pending_paths: Vec::new(),
-                    last_watch_event: None,
-                    watcher_started: None,
+                    sync: BackgroundSync::default(),
                     query_ms: 0.0,
                     hotkey: None,
                     shortcut_editor: false,
@@ -205,7 +214,7 @@ impl MiaoFindApp {
                 save_editor: false,
                 manage_filters: false,
                 bookmark_name: String::new(),
-                index: CompactIndex::default(),
+                index: Arc::default(),
                 results: Vec::new(),
                 paging: paging::Paging::new(context.egui_ctx.clone()),
                 selected_result: None,
@@ -231,10 +240,7 @@ impl MiaoFindApp {
                 scan_receiver: None,
                 watcher: None,
                 watch_receiver: None,
-                update_receiver: None,
-                pending_paths: Vec::new(),
-                last_watch_event: None,
-                watcher_started: None,
+                sync: BackgroundSync::default(),
                 query_ms: 0.0,
                 hotkey: None,
                 shortcut_editor: false,
@@ -262,14 +268,7 @@ impl MiaoFindApp {
                     env!("CARGO_PKG_VERSION")
                 ),
             ));
-        for root in filters::default_roots()
-            .into_iter()
-            .chain(app.preferences.personal_roots.clone())
-        {
-            if !app.preferences.scope_locations.contains(&root) {
-                app.preferences.scope_locations.push(root);
-            }
-        }
+        app.preferences.refresh_locations();
         app.personal_mask = app.index.personal_mask_with_exclusions(
             &app.preferences.personal_roots,
             &app.preferences.exclusions,
@@ -284,19 +283,13 @@ impl MiaoFindApp {
             app.shortcut_feedback = error.clone();
             app.status = error;
         }
+        app.start_watcher();
         #[cfg(target_os = "macos")]
         {
             app.history = date_history::History::start(&app.index, app.app_context.clone());
         }
-        app.start_watcher();
         app.start_dates();
-        let (sender, receiver) = mpsc::channel();
-        app.update_receiver = Some(receiver);
-        let repaint = app.app_context.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(index::pending_journal_delta());
-            repaint.request_repaint();
-        });
+        app.sync.replay_journal = !app.roots.is_empty();
         app
     }
 
@@ -511,6 +504,7 @@ impl MiaoFindApp {
                                     |ui| {
                                         ui.spacing_mut().item_spacing.y = 4.0;
                                         let display = match label.as_str() {
+                                            _ if short == "~" => crate::i18n::tr("个人主目录 (~)"),
                                             "Desktop" => crate::i18n::tr("桌面"),
                                             "Documents" => crate::i18n::tr("文稿"),
                                             "Downloads" => crate::i18n::tr("下载"),
@@ -575,7 +569,7 @@ impl MiaoFindApp {
                 ui.collapsing(crate::i18n::tr("高级：排除规则"), |ui| {
                     ui.label(
                         RichText::new(crate::i18n::tr(
-                            "每行一个目录名。.* 排除隐藏目录，*.app 排除应用包。",
+                            "每行一个目录名。.* 排除隐藏目录，*.app 隐藏应用包内部文件，保留应用名称。",
                         ))
                         .size(design::CAPTION)
                         .color(design::SECONDARY),
@@ -946,7 +940,7 @@ impl MiaoFindApp {
         }
         let paths = self.index.missing_date_batch(&mut self.date_cursor);
         if paths.is_empty() {
-            if let Err(error) = self.index.finish_date_repair() {
+            if let Err(error) = Arc::make_mut(&mut self.index).finish_date_repair() {
                 self.status = crate::i18n::localized_format!(
                     "日期缓存保存失败：{error}",
                     "Could not save date cache: {error}"
@@ -968,7 +962,7 @@ impl MiaoFindApp {
         if let Some(receiver) = self.date_receiver.take() {
             match receiver.try_recv() {
                 Ok(dates) => {
-                    self.index.apply_date_batch(dates);
+                    Arc::make_mut(&mut self.index).apply_date_batch(dates);
                     self.start_dates();
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1008,6 +1002,7 @@ impl MiaoFindApp {
             return;
         }
         let (sender, receiver) = mpsc::channel();
+        self.finish_checkpoint();
         self.scanning = true;
         self.status = if roots == index::full_disk_roots() {
             crate::i18n::tr("正在建立全盘索引…").to_owned()
@@ -1038,14 +1033,17 @@ impl MiaoFindApp {
                 }
                 ScanMessage::Finished { index, elapsed_ms } => {
                     self.roots = index.roots().to_vec();
-                    self.index = index;
+                    self.index = Arc::new(index);
                     #[cfg(target_os = "macos")]
                     {
                         self.history = date_history::History::after_rebuild(&self.index);
                     }
                     self.date_receiver = None;
-                    self.pending_paths.clear();
-                    self.update_receiver = None;
+                    self.sync.receiver = None;
+                    self.sync.replay_journal = true;
+                    self.sync.applied_end = 0;
+                    self.sync.flush_at = None;
+                    self.date_cursor = 0;
                     self.scanning = false;
                     self.last_query.clear();
                     self.filter_signature.clear();
@@ -1059,6 +1057,12 @@ impl MiaoFindApp {
                         self.index.len(),
                         elapsed_ms as f64 / 1000.0
                     );
+                    #[cfg(target_os = "macos")]
+                    if let Some(history) = &self.history
+                        && let Err(error) = history.checkpoint()
+                    {
+                        self.status = error.to_string();
+                    }
                     self.start_watcher();
                     keep_receiver = false;
                 }
@@ -1082,9 +1086,16 @@ impl MiaoFindApp {
         }
         let (sender, receiver) = mpsc::channel();
         let repaint = self.app_context.clone();
+        let roots = self.roots.clone();
         let watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
-                Ok(event) if is_index_relevant(&event.kind) => {
+                Ok(mut event) if is_index_relevant(&event.kind) => {
+                    event
+                        .paths
+                        .retain(|p| !roots.contains(p) && index::sync_path(p, &roots));
+                    if event.paths.is_empty() {
+                        return;
+                    }
                     let _ = sender.send(Ok(event));
                     repaint.request_repaint();
                 }
@@ -1110,22 +1121,20 @@ impl MiaoFindApp {
         }
         self.watcher = Some(watcher);
         self.watch_receiver = Some(receiver);
-        self.watcher_started = Some(Instant::now());
     }
 
-    fn receive_file_updates(&mut self, context: &egui::Context) {
-        let Some(receiver) = self.watch_receiver.take() else {
+    fn drain_watch_events(&mut self) {
+        let Some(receiver) = &self.watch_receiver else {
             return;
         };
         while let Ok(event) = receiver.try_recv() {
             match event {
                 Ok(event) => {
-                    if self.watcher_started.is_none_or(|started| {
-                        started.elapsed() >= std::time::Duration::from_secs(2)
-                    }) {
-                        self.pending_paths.extend(event.paths);
-                        self.last_watch_event = Some(Instant::now());
-                    }
+                    self.sync.pending.extend(event.paths);
+                    // A continuous stream still gets processed once per window.
+                    self.sync
+                        .next_batch
+                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
                 }
                 Err(error) => {
                     self.status = crate::i18n::localized_format!(
@@ -1135,75 +1144,180 @@ impl MiaoFindApp {
                 }
             }
         }
-        self.watch_receiver = Some(receiver);
+    }
 
-        if let Some(update_receiver) = self.update_receiver.take() {
-            match update_receiver.try_recv() {
-                Ok(Ok(delta)) => self.apply_delta(delta),
-                Ok(Err(error)) => {
-                    self.status = crate::i18n::localized_format!(
-                        "增量索引更新失败：{error}",
-                        "Index update failed: {error}"
-                    )
+    fn finish_checkpoint(&mut self) {
+        if let Some(job) = self.sync.checkpoint.take() {
+            match job
+                .join()
+                .unwrap_or_else(|_| Err("Index checkpoint worker stopped".into()))
+            {
+                Ok(()) => {
+                    self.sync.applied_end = 0;
+                    self.sync.flush_at = None;
+                    #[cfg(target_os = "macos")]
+                    if self.index.dates_ready()
+                        && let Some(history) = &self.history
+                        && let Err(error) = history.checkpoint()
+                    {
+                        self.status = error.to_string();
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    self.update_receiver = Some(update_receiver);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.status = crate::i18n::tr("后台索引更新意外停止").to_owned();
+                Err(error) => {
+                    self.status = error;
+                    self.sync.flush_at = Some(Instant::now() + FLUSH_INTERVAL);
                 }
             }
-        }
-
-        if self.scanning || self.update_receiver.is_some() || self.pending_paths.is_empty() {
-            if self.update_receiver.is_some() || !self.pending_paths.is_empty() {
-                context.request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            return;
-        }
-        if self
-            .last_watch_event
-            .is_some_and(|last| last.elapsed() < std::time::Duration::from_millis(250))
-        {
-            context.request_repaint_after(std::time::Duration::from_millis(100));
-            return;
-        }
-
-        let paths = coalesce_paths(std::mem::take(&mut self.pending_paths), &self.roots);
-        if !paths.is_empty() {
-            let (sender, receiver) = mpsc::channel();
-            index::update_paths(paths, sender);
-            self.update_receiver = Some(receiver);
-            self.status = crate::i18n::tr("正在后台同步文件变化…").to_owned();
-            context.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
-    fn apply_delta(&mut self, delta: IndexDelta) {
-        if delta.changed() == 0 {
+    fn receive_file_updates(&mut self, context: &egui::Context) {
+        self.drain_watch_events();
+        if self.scanning {
             return;
         }
-        match self.index.apply_delta(delta) {
-            Ok(()) => {
-                self.last_query.clear();
-                self.filter_signature.clear();
-                self.personal_mask = self.index.personal_mask_with_exclusions(
-                    &self.preferences.personal_roots,
-                    &self.preferences.exclusions,
-                );
-                self.status = crate::i18n::localized_format!(
-                    "索引已自动更新，当前共 {} 项",
-                    "Index updated: {} items",
-                    self.index.len()
-                );
+        if let Some(job) = &self.sync.checkpoint {
+            if !job.is_finished() {
+                context.request_repaint_after(Duration::from_millis(200));
+                return;
             }
-            Err(error) => {
-                self.status = crate::i18n::localized_format!(
-                    "增量索引更新失败：{error}",
-                    "Index update failed: {error}"
-                )
+            self.finish_checkpoint();
+        }
+        if let Some(receiver) = &self.sync.receiver {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(crate::i18n::tr("后台索引更新意外停止").into())
+                }
+            };
+            self.sync.receiver = None;
+            match result.and_then(|(delta, end)| self.apply_delta(delta).map(|_| end)) {
+                Ok(end) => {
+                    self.sync.applied_end = end;
+                    if end > 0 {
+                        self.sync
+                            .flush_at
+                            .get_or_insert_with(|| Instant::now() + FLUSH_INTERVAL);
+                    }
+                }
+                Err(error) => {
+                    self.sync.replay_journal = true;
+                    self.sync.next_batch = Some(Instant::now() + Duration::from_secs(10));
+                    self.status = crate::i18n::localized_format!(
+                        "增量索引更新失败：{error}",
+                        "Index update failed: {error}"
+                    );
+                }
             }
         }
+        #[cfg(target_os = "macos")]
+        if !self.sync.replay_journal
+            && let Some(result) = self
+                .history
+                .as_mut()
+                .and_then(|h| h.poll(Arc::make_mut(&mut self.index)))
+        {
+            self.filter_signature.clear();
+            match result {
+                Ok(structural_changes) => {
+                    self.sync.replay_journal |= structural_changes;
+                    context.request_repaint();
+                }
+                Err(error) => {
+                    self.sync.replay_journal = true;
+                    self.status = error;
+                }
+            }
+        }
+        if let Some(at) = self.sync.flush_at {
+            if at <= Instant::now() && !self.sync.replay_journal {
+                // Snapshot once per interval. Keep UI record IDs stable for in-flight queries
+                // and date batches. The worker owns the journal until its snapshot is on disk.
+                let snapshot = Arc::clone(&self.index);
+                let end = self.sync.applied_end;
+                let repaint = context.clone();
+                self.sync.checkpoint = Some(std::thread::spawn(move || {
+                    let result = index::checkpoint_journal(&snapshot, end);
+                    repaint.request_repaint();
+                    result
+                }));
+                context.request_repaint_after(Duration::from_millis(200));
+                return;
+            }
+            context.request_repaint_after(
+                at.saturating_duration_since(Instant::now())
+                    .max(Duration::from_secs(1)),
+            );
+        }
+        if self.sync.pending.is_empty() && !self.sync.replay_journal {
+            return;
+        }
+        if let Some(delay) = self
+            .sync
+            .next_batch
+            .and_then(|at| at.checked_duration_since(Instant::now()))
+        {
+            context.request_repaint_after(delay);
+            return;
+        }
+        self.sync.next_batch = None;
+        let replay = self.sync.replay_journal;
+        // Recover a torn journal tail before queuing any new records behind it.
+        let paths = if replay {
+            Vec::new()
+        } else {
+            index::dedup_paths(
+                self.sync
+                    .pending
+                    .drain()
+                    .filter(|p| !self.roots.contains(p) && index::sync_path(p, &self.roots))
+                    .collect(),
+            )
+        };
+        if !paths.is_empty()
+            && let Err(error) = index::append_journal(&paths)
+        {
+            self.sync.pending.extend(paths);
+            self.sync.next_batch = Some(Instant::now() + Duration::from_secs(10));
+            self.status = error;
+            context.request_repaint_after(Duration::from_secs(10));
+            return;
+        }
+        self.sync.replay_journal = false;
+        let scope = self.index.delta_scope();
+        let (sender, receiver) = mpsc::channel();
+        self.sync.receiver = Some(receiver);
+        let repaint = context.clone();
+        std::thread::spawn(move || {
+            let result = if replay {
+                index::pending_journal_delta(scope)
+            } else {
+                scope.collect_delta(paths)
+            }
+            .and_then(|delta| Ok((delta, index::journal_length()?)));
+            let _ = sender.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    fn apply_delta(&mut self, delta: IndexDelta) -> Result<(), String> {
+        if delta.changed() > 0 {
+            Arc::make_mut(&mut self.index).apply_delta(delta)?;
+            self.last_query.clear();
+            self.filter_signature.clear();
+            self.index.extend_personal_mask(
+                &mut self.personal_mask,
+                &self.preferences.personal_roots,
+                &self.preferences.exclusions,
+            );
+            self.status = crate::i18n::localized_format!(
+                "索引已自动更新，当前共 {} 项",
+                "Index updated: {} items",
+                self.index.len()
+            );
+        }
+        Ok(())
     }
 
     fn apply_filter(&mut self, filter: SavedFilter) {
@@ -1604,44 +1718,6 @@ fn is_index_relevant(kind: &notify::EventKind) -> bool {
     )
 }
 
-fn coalesce_paths(mut paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBuf> {
-    paths.retain(|path| !roots.iter().any(|root| root == path));
-    paths.sort();
-    paths.dedup();
-    if paths.len() >= 50 {
-        if let Some(common) = common_parent(&paths) {
-            let is_deep_enough = roots.iter().any(|root| {
-                common
-                    .strip_prefix(root)
-                    .is_ok_and(|relative| relative.components().count() >= 2)
-            });
-            if is_deep_enough {
-                return vec![common];
-            }
-        }
-    }
-    paths.sort_by_key(|path| path.components().count());
-    let mut result = Vec::<PathBuf>::new();
-    for path in paths {
-        if !result.iter().any(|parent| path.starts_with(parent)) {
-            result.push(path);
-        }
-    }
-    result
-}
-
-fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
-    let mut common = paths.first()?.parent()?.to_path_buf();
-    for path in paths.iter().skip(1) {
-        while !path.starts_with(&common) {
-            if !common.pop() {
-                return None;
-            }
-        }
-    }
-    Some(common)
-}
-
 fn install_visual_style(context: &egui::Context) {
     let mut style = (*context.style_of(egui::Theme::Light)).clone();
     style.visuals = egui::Visuals::light();
@@ -1695,7 +1771,19 @@ impl eframe::App for MiaoFindApp {
         eframe::set_value(storage, "search_preferences_v1", &self.preferences);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.index.persist().is_ok() && self.index.dates_ready() {
+        self.finish_checkpoint();
+        self.drain_watch_events();
+        let pending = index::dedup_paths(self.sync.pending.drain().collect());
+        if !pending.is_empty() {
+            let _ = index::append_journal(&pending);
+        }
+        if !self.scanning
+            && Arc::make_mut(&mut self.index).persist().is_ok()
+            && self.index.dates_ready()
+        {
+            if !self.sync.replay_journal && self.sync.receiver.is_none() {
+                let _ = index::acknowledge_applied(self.sync.applied_end);
+            }
             #[cfg(target_os = "macos")]
             if let Some(history) = &self.history {
                 let _ = history.checkpoint();
@@ -1730,14 +1818,8 @@ impl eframe::App for MiaoFindApp {
         }
         self.receive_scan_updates(&context);
         self.receive_file_updates(&context);
-        self.receive_dates(&context);
-        #[cfg(target_os = "macos")]
-        if let Some(complete) = self.history.as_mut().and_then(|h| h.poll(&mut self.index)) {
-            self.filter_signature.clear();
-            if !complete {
-                self.status =
-                    crate::i18n::tr("文件变更历史不完整，如需核对全部日期，请重新建立索引").into();
-            }
+        if !self.scanning && self.sync.checkpoint.is_none() {
+            self.receive_dates(&context);
         }
         self.thumbnails.receive(&context);
         self.preview.receive(&context);
@@ -2161,6 +2243,14 @@ impl eframe::App for MiaoFindApp {
             ui.horizontal_wrapped(|ui| {
                 if self.scanning || self.date_receiver.is_some() {
                     ui.spinner();
+                }
+                #[cfg(target_os = "macos")]
+                if self
+                    .history
+                    .as_ref()
+                    .is_some_and(|history| history.has_gap())
+                {
+                    ui.label(crate::i18n::tr("离线变更历史不完整，请重新建立索引"));
                 }
                 let status = if self.date_receiver.is_some() {
                     crate::i18n::tr("正在核对修改日期")

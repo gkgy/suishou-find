@@ -22,11 +22,15 @@ const UNKNOWN_DATE: i64 = i64::MIN;
 // Distinguish a missing cache entry from a cached "metadata unavailable" result.
 const UNCACHED_DATE: i64 = i64::MIN + 1;
 const DATE_BATCH_SIZE: usize = 2048;
+pub const JOURNAL_NAME: &str = "changes-v3.log";
 const DATE_MAGIC: &[u8; 8] = b"MIAODATE";
 const MAGIC: &[u8; 8] = b"MIAOIDX3";
+static JOURNAL_LOCK: Mutex<()> = Mutex::new(());
 const NO_PARENT: u32 = u32::MAX;
 const ALIVE: u8 = 1;
 const DIRECTORY: u8 = 2;
+// Directory metadata updated after launch takes precedence over historical dates.
+const UPDATED: u8 = 4;
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
@@ -138,6 +142,7 @@ pub struct CompactIndex {
     records: Vec<Record>,
     names: NameStore,
     path_hashes: Vec<u64>,
+    directory_ids: Arc<HashMap<u64, u32>>,
     roots: Vec<PathBuf>,
     active_count: usize,
     dates_ready: bool,
@@ -205,31 +210,47 @@ impl CompactIndex {
         roots: &[PathBuf],
         exclusions: &[String],
     ) -> Vec<bool> {
+        let mut mask = Vec::with_capacity(self.records.len());
+        self.extend_personal_mask(&mut mask, roots, exclusions);
+        mask
+    }
+
+    pub fn extend_personal_mask(
+        &self,
+        mask: &mut Vec<bool>,
+        roots: &[PathBuf],
+        exclusions: &[String],
+    ) {
         let roots: HashSet<u64> = roots
             .iter()
             .map(|p| hash_path(&p.to_string_lossy()))
             .collect();
         let excluded_names: HashSet<&str> = exclusions.iter().map(String::as_str).collect();
-        let mut mask = vec![false; self.records.len()];
-        for (id, record) in self.records.iter().enumerate() {
+        let hide_bundle_contents = excluded_names.contains("*.app");
+        for (id, record) in self.records.iter().enumerate().skip(mask.len()) {
             let name = self.name(id);
+            let parent = record.parent as usize;
             let excluded = self.is_dir(id)
                 && (excluded_names.contains(name)
-                    || (excluded_names.contains(".*") && name.starts_with('.'))
-                    || (excluded_names.contains("*.app") && name.ends_with(".app")));
-            mask[id] = roots.contains(&self.path_hashes[id])
-                || (!excluded && record.parent != NO_PARENT && mask[record.parent as usize]);
+                    || (excluded_names.contains(".*") && name.starts_with('.')));
+            mask.push(
+                roots.contains(&self.path_hashes[id])
+                    || (!excluded
+                        && record.parent != NO_PARENT
+                        && mask[parent]
+                        && !(hide_bundle_contents
+                            && self.name(parent).ends_with(".app")
+                            && !roots.contains(&self.path_hashes[parent]))),
+            );
         }
-        mask
     }
 
-    fn from_flat(roots: Vec<PathBuf>, mut flat: Vec<FlatEntry>) -> Result<Self, String> {
-        flat.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-        flat.dedup_by(|a, b| a.path == b.path);
+    fn from_flat(roots: Vec<PathBuf>, flat: Vec<FlatEntry>) -> Result<Self, String> {
         let mut index = Self {
             records: Vec::with_capacity(flat.len()),
             names: NameStore::with_capacity(flat.len().saturating_mul(20)),
             path_hashes: Vec::with_capacity(flat.len()),
+            directory_ids: Default::default(),
             roots: normalize_roots(roots),
             active_count: 0,
             dates_ready: true,
@@ -240,18 +261,7 @@ impl CompactIndex {
     fn append_flat(&mut self, mut flat: Vec<FlatEntry>) -> Result<(), String> {
         flat.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         flat.dedup_by(|a, b| a.path == b.path);
-        let needed: HashSet<u64> = flat
-            .iter()
-            .filter_map(|entry| Path::new(entry.path.as_ref()).parent())
-            .filter_map(Path::to_str)
-            .map(hash_path)
-            .collect();
-        let mut directory_ids = HashMap::<u64, u32>::with_capacity(needed.len() * 2 + 16);
-        for (id, (&hash, record)) in self.path_hashes.iter().zip(&self.records).enumerate() {
-            if record.flags & (ALIVE | DIRECTORY) == ALIVE | DIRECTORY && needed.contains(&hash) {
-                directory_ids.insert(hash, id as u32);
-            }
-        }
+        let directory_ids = Arc::make_mut(&mut self.directory_ids);
         let roots: HashSet<String> = self
             .roots
             .iter()
@@ -271,7 +281,7 @@ impl CompactIndex {
                     .and_then(Path::to_str)
                     .ok_or_else(|| format!("无法确定父目录：{path}"))?;
                 let Some(&parent) = directory_ids.get(&hash_path(parent_path)) else {
-                    continue;
+                    return Err(format!("增量索引缺少父目录：{parent_path}"));
                 };
                 let name = value
                     .file_name()
@@ -306,22 +316,62 @@ impl CompactIndex {
         Ok(())
     }
     pub fn apply_delta(&mut self, delta: IndexDelta) -> Result<(), String> {
-        let removed: HashSet<u64> = delta
+        if delta.changed() == 0 {
+            return Ok(());
+        }
+        let removed: HashSet<_> = delta
             .removed_prefixes
             .iter()
-            .map(|path| hash_path(path))
+            .map(|p| hash_path(p))
             .collect();
-        for index in 0..self.records.len() {
-            let parent_removed = self.records[index].parent != NO_PARENT
-                && !self.is_alive(self.records[index].parent as usize);
-            if self.is_alive(index)
-                && (removed.contains(&self.path_hashes[index]) || parent_removed)
+        let mut additions: HashMap<_, _> = delta
+            .additions
+            .into_iter()
+            .map(|entry| (hash_path(&entry.path), entry))
+            .collect();
+        // Keep IDs of directories that still exist. This also preserves the cached
+        // full-disk contents of noisy subtrees deliberately pruned from this walk.
+        let mut refreshing = vec![false; self.records.len()];
+        let directory_ids = Arc::make_mut(&mut self.directory_ids);
+        for (id, record) in self.records.iter_mut().enumerate() {
+            if record.flags & ALIVE == 0 {
+                continue;
+            }
+            let hash = self.path_hashes[id];
+            let covered = removed.contains(&hash)
+                || (record.parent != NO_PARENT && refreshing[record.parent as usize]);
+            if !covered {
+                continue;
+            }
+            if delta.opaque.contains(&hash) {
+                additions.remove(&hash);
+                continue;
+            }
+            let was_directory = record.flags & DIRECTORY != 0;
+            refreshing[id] = was_directory;
+            if additions
+                .get(&hash)
+                .is_some_and(|entry| entry.is_dir == was_directory)
             {
-                self.records[index].flags &= !ALIVE;
-                self.active_count -= 1;
+                let entry = additions.remove(&hash).unwrap();
+                record.modified = entry.modified;
+                record.flags |= UPDATED;
+                continue;
+            }
+            record.flags &= !ALIVE;
+            self.active_count -= 1;
+            if was_directory {
+                directory_ids.remove(&hash);
             }
         }
-        self.append_flat(delta.additions)
+        self.append_flat(additions.into_values().collect())
+    }
+
+    pub fn delta_scope(&self) -> DeltaScope {
+        DeltaScope {
+            roots: self.roots.clone(),
+            directory_ids: self.directory_ids.clone(),
+        }
     }
 
     pub fn persist(&mut self) -> Result<(), String> {
@@ -361,6 +411,7 @@ impl CompactIndex {
             self.names = names.into();
             self.path_hashes = path_hashes;
             self.active_count = self.records.len();
+            self.directory_ids = Arc::new(directory_map(&self.records, &self.path_hashes));
         }
         save_compact(self)
     }
@@ -381,6 +432,7 @@ pub struct IndexDelta {
     removed_prefixes: Vec<String>,
     additions: Vec<FlatEntry>,
     changed: usize,
+    opaque: HashSet<u64>,
 }
 impl IndexDelta {
     pub fn changed(&self) -> usize {
@@ -419,10 +471,10 @@ impl CompactIndex {
             .zip(&mut self.records)
             .take(original_records)
         {
-            if record.flags & ALIVE != 0 {
-                if let Some(date) = dates.get(&hash) {
-                    record.modified = date.unwrap_or(UNKNOWN_DATE);
-                }
+            if record.flags & (ALIVE | UPDATED) == ALIVE
+                && let Some(date) = dates.get(&hash)
+            {
+                record.modified = date.unwrap_or(UNKNOWN_DATE);
             }
         }
     }
@@ -494,7 +546,10 @@ fn save_dates_to(index: &CompactIndex, path: &Path) -> Result<(), String> {
             .write_all(&record.modified.to_le_bytes())
             .map_err(|e| e.to_string())?;
     }
-    writer.flush().map_err(|e| e.to_string())?;
+    writer
+        .flush()
+        .and_then(|_| writer.get_ref().sync_all())
+        .map_err(|e| e.to_string())?;
     fs::rename(temporary, path).map_err(|e| e.to_string())
 }
 fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
@@ -515,6 +570,7 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
     // records on a normal launch, checking every path before accepting its date.
     if count == index.active_count as u64 {
         let mut aligned = true;
+        let mut complete = true;
         for (&expected, record) in index.path_hashes.iter().zip(&mut index.records) {
             if record.flags & ALIVE == 0 {
                 continue;
@@ -524,9 +580,10 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
                 break;
             }
             record.modified = read_u64(&mut reader)? as i64;
+            complete &= record.modified != UNCACHED_DATE;
         }
         if aligned {
-            index.dates_ready = true;
+            index.dates_ready = complete;
             return Ok(());
         }
         reader
@@ -544,7 +601,7 @@ fn load_dates(index: &mut CompactIndex, path: &Path) -> Result<(), String> {
         .iter()
         .zip(&index.records)
         .filter(|(_, r)| r.flags & ALIVE != 0)
-        .all(|(hash, _)| dates.contains_key(hash));
+        .all(|(hash, _)| dates.get(hash).is_some_and(|date| *date != UNCACHED_DATE));
     for (hash, record) in index.path_hashes.iter().zip(&mut index.records) {
         record.modified = dates.get(hash).copied().unwrap_or(UNCACHED_DATE);
     }
@@ -625,6 +682,7 @@ pub fn default_personal_exclusions() -> Vec<String> {
         ".*",
         "*.app",
         "Library",
+        "Caches",
         "node_modules",
         "target",
         "venv",
@@ -1041,17 +1099,27 @@ pub fn full_disk_roots() -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn local_external_volumes() -> Vec<PathBuf> {
-    let mut mounts: *mut libc::statfs = std::ptr::null_mut();
-    // SAFETY: getmntinfo returns a system-owned array with the returned count.
-    let count = unsafe { libc::getmntinfo(&mut mounts, libc::MNT_NOWAIT) };
-    if count <= 0 || mounts.is_null() {
+pub fn local_external_volumes() -> Vec<PathBuf> {
+    // Preferences and index setup can enumerate mounts concurrently. Ask the
+    // kernel for a private snapshot instead of sharing getmntinfo's static array.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count <= 0 {
         return Vec::new();
     }
+    let mut mounts: Vec<libc::statfs> = Vec::with_capacity(count as usize);
+    let Ok(size) = i32::try_from(mounts.capacity() * size_of::<libc::statfs>()) else {
+        return Vec::new();
+    };
+    let count = unsafe { libc::getfsstat(mounts.as_mut_ptr(), size, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // SAFETY: getfsstat initialized the entries that fit in the supplied buffer.
+    unsafe {
+        mounts.set_len((count as usize).min(mounts.capacity()));
+    }
     let mut volumes = Vec::new();
-    for index in 0..count as usize {
-        // SAFETY: index is bounded by the returned count.
-        let mount = unsafe { &*mounts.add(index) };
+    for mount in mounts {
         if mount.f_flags & libc::MNT_LOCAL as u32 == 0 {
             continue;
         }
@@ -1065,7 +1133,7 @@ fn local_external_volumes() -> Vec<PathBuf> {
     volumes
 }
 #[cfg(not(target_os = "macos"))]
-fn local_external_volumes() -> Vec<PathBuf> {
+pub fn local_external_volumes() -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -1079,7 +1147,7 @@ pub fn compact_index_path() -> Result<PathBuf, String> {
     Ok(data_dir()?.join("index-v3.bin"))
 }
 fn journal_path() -> Result<PathBuf, String> {
-    Ok(data_dir()?.join("changes-v3.log"))
+    Ok(data_dir()?.join(JOURNAL_NAME))
 }
 fn legacy_path() -> Result<PathBuf, String> {
     Ok(data_dir()?.join("index.sqlite3"))
@@ -1087,12 +1155,12 @@ fn legacy_path() -> Result<PathBuf, String> {
 
 pub fn load() -> Result<CompactIndex, String> {
     let mut index = load_cached()?;
-    index.apply_delta(pending_journal_delta()?)?;
+    index.apply_delta(pending_journal_delta(index.delta_scope())?)?;
     Ok(index)
 }
 
-pub fn pending_journal_delta() -> Result<IndexDelta, String> {
-    collect_delta(read_journal()?, false)
+pub fn pending_journal_delta(scope: DeltaScope) -> Result<IndexDelta, String> {
+    scope.collect_delta(read_journal(&journal_path()?, &scope.roots)?)
 }
 
 pub fn load_cached() -> Result<CompactIndex, String> {
@@ -1138,14 +1206,29 @@ fn migrate_legacy() -> Result<CompactIndex, String> {
     for row in rows {
         flat.push(row.map_err(|error| error.to_string())?);
     }
+    // An older SQLite index can include entries on a currently unmounted volume.
+    let roots = normalize_roots(roots);
+    flat.retain(|entry| {
+        roots
+            .iter()
+            .any(|root| Path::new(entry.path.as_ref()).starts_with(root))
+    });
     let mut index = CompactIndex::from_flat(roots, flat)?;
     index.dates_ready = false;
+    let _ = load_dates(&mut index, &data_dir()?.join("modified-v1.bin"));
     save_compact(&index)?;
     Ok(index)
 }
 
 fn save_compact(index: &CompactIndex) -> Result<(), String> {
-    let path = compact_index_path()?;
+    write_snapshot(
+        index,
+        &compact_index_path()?,
+        &data_dir()?.join("modified-v1.bin"),
+    )
+}
+
+fn write_snapshot(index: &CompactIndex, path: &Path, dates: &Path) -> Result<(), String> {
     let temporary = path.with_extension("tmp");
     let mut writer = BufWriter::with_capacity(
         1024 * 1024,
@@ -1167,17 +1250,26 @@ fn save_compact(index: &CompactIndex) -> Result<(), String> {
             .write_all(&record.parent.to_le_bytes())
             .and_then(|_| writer.write_all(&record.name_start.to_le_bytes()))
             .and_then(|_| writer.write_all(&record.name_len.to_le_bytes()))
-            .and_then(|_| writer.write_all(&[record.flags, 0]))
+            .and_then(|_| writer.write_all(&[record.flags & (ALIVE | DIRECTORY), 0]))
             .map_err(|error| error.to_string())?;
     }
     index
         .names
         .write_to(&mut writer)
         .map_err(|error| error.to_string())?;
-    writer.flush().map_err(|error| error.to_string())?;
-    fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
-    File::create(journal_path()?).map_err(|error| error.to_string())?;
-    index.save_dates()?;
+    writer
+        .flush()
+        .and_then(|_| writer.get_ref().sync_all())
+        .map_err(|error| error.to_string())?;
+    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    // A checkpoint may run during date repair. Persist the per-record missing
+    // sentinel too, so flushed live dates survive and repair resumes on restart.
+    save_dates_to(index, dates)?;
+    if let Some(dir) = path.parent() {
+        File::open(dir)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1233,7 +1325,7 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
             parent,
             name_start,
             name_len,
-            flags: flags[0],
+            flags: flags[0] & (ALIVE | DIRECTORY),
             modified: UNCACHED_DATE,
         });
     }
@@ -1274,7 +1366,16 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
         let hash = if record.parent == NO_PARENT {
             hash_bytes(&names[start..end])
         } else {
-            extend_hash(path_hashes[record.parent as usize], &names[start..end])
+            let parent = records[record.parent as usize];
+            let parent_end = parent.name_start as usize + parent.name_len as usize;
+            let has_separator = parent.parent == NO_PARENT
+                && parent.name_len > 0
+                && names.slice(parent_end - 1, 1) == b"/";
+            let mut hash = path_hashes[record.parent as usize];
+            if !has_separator {
+                hash = extend_hash(hash, b"/");
+            }
+            extend_hash(hash, &names[start..end])
         };
         path_hashes.push(hash);
     }
@@ -1283,6 +1384,7 @@ pub fn load_compact(path: &Path) -> Result<CompactIndex, String> {
         .filter(|record| record.flags & ALIVE != 0)
         .count();
     Ok(CompactIndex {
+        directory_ids: Arc::new(directory_map(&records, &path_hashes)),
         records,
         names,
         path_hashes,
@@ -1375,85 +1477,281 @@ fn make_flat(path: &Path, known_is_dir: Option<bool>) -> Option<FlatEntry> {
     })
 }
 
-pub fn update_paths(paths: Vec<PathBuf>, sender: Sender<Result<IndexDelta, String>>) {
-    std::thread::spawn(move || {
-        let _ = sender.send(collect_delta(paths, true));
-    });
+fn directory_map(records: &[Record], hashes: &[u64]) -> HashMap<u64, u32> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.flags & (ALIVE | DIRECTORY) == ALIVE | DIRECTORY)
+        .map(|(id, _)| (hashes[id], id as u32))
+        .collect()
 }
 
-fn collect_delta(paths: Vec<PathBuf>, persist: bool) -> Result<IndexDelta, String> {
-    let mut paths: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|path| {
-            !path
-                .to_string_lossy()
-                .contains("/Application Support/com.gkgy.MiaoFind/")
-        })
-        .collect();
-    paths.sort();
-    paths.dedup();
-    if persist && !paths.is_empty() {
-        append_journal(&paths)?;
+/// A worker only needs the indexed directory IDs, never a copy of all file records.
+pub struct DeltaScope {
+    roots: Vec<PathBuf>,
+    directory_ids: Arc<HashMap<u64, u32>>,
+}
+
+pub fn sync_path(path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(root) = roots.iter().find(|root| path.starts_with(root)) else {
+        return false;
+    };
+    if should_skip(path)
+        || path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return false;
     }
-    let mut removed_prefixes = Vec::with_capacity(paths.len());
-    let mut additions = Vec::new();
-    for path in &paths {
-        removed_prefixes.push(path.to_string_lossy().into_owned());
-        if path.is_dir() {
-            for item in WalkBuilder::new(path)
-                .hidden(false)
+    // Do not feed our own journal, snapshots or eframe autosaves back to the watcher.
+    if path.ancestors().any(|p| {
+        p.ends_with("Library/Application Support/com.gkgy.MiaoFind")
+            || p.ends_with("Library/Application Support/随手找")
+    }) {
+        return false;
+    }
+    // An explicitly indexed project or cache within a temporary directory still works.
+    for prefix in [
+        "/private/var/folders",
+        "/private/tmp",
+        "/var/folders",
+        "/tmp",
+        "/System/Library/AssetsV2",
+        "/Library/Application Support/Apple/AssetCache",
+        "/private/var/db/biome",
+    ] {
+        if path.starts_with(prefix) && !root.starts_with(prefix) {
+            return false;
+        }
+    }
+    let relative = path.strip_prefix(root).unwrap();
+    !relative.components().any(|c| c.as_os_str() == "Caches")
+}
+
+/// Path ordering compares components, so a directory and all of its descendants
+/// are adjacent. Never invent a common parent for independent sibling events.
+pub fn dedup_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_unstable();
+    let mut kept = Vec::<PathBuf>::new();
+    for path in paths {
+        if kept.last().is_none_or(|parent| !path.starts_with(parent)) {
+            kept.push(path);
+        }
+    }
+    kept
+}
+
+impl DeltaScope {
+    fn scan_paths(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        let mut result = Vec::new();
+        for path in paths {
+            if !sync_path(&path, &self.roots) {
+                continue;
+            }
+            let root = self.roots.iter().find(|r| path.starts_with(r)).unwrap();
+            if &path == root
+                && self
+                    .directory_ids
+                    .contains_key(&hash_path(&root.to_string_lossy()))
+            {
+                // A watched root's metadata event must never trigger a volume-wide walk.
+                continue;
+            }
+            let mut start = path.as_path();
+            while start != root {
+                let parent = start.parent().unwrap();
+                if self
+                    .directory_ids
+                    .contains_key(&hash_path(&parent.to_string_lossy()))
+                {
+                    break;
+                }
+                start = parent;
+            }
+            result.push(start.to_owned());
+        }
+        dedup_paths(result)
+    }
+
+    pub fn collect_delta(&self, paths: Vec<PathBuf>) -> Result<IndexDelta, String> {
+        let paths = self.scan_paths(paths);
+        let mut additions = Vec::new();
+        let mut opaque = HashSet::new();
+        let mut removed_prefixes = Vec::new();
+        let mut directories = Vec::new();
+        for path in paths {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => directories.push(path.clone()),
+                Ok(_) => additions.extend(make_flat(&path, Some(false))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+            removed_prefixes.push(path.to_string_lossy().into_owned());
+        }
+        if let Some((first, rest)) = directories.split_first() {
+            let mut walk = WalkBuilder::new(first);
+            for path in rest {
+                walk.add(path);
+            }
+            // Each worker buffers its own entries. Merge once per worker, not once per file.
+            let output = Mutex::new((&mut additions, &mut opaque));
+            let mut visitor = DeltaVisitors {
+                output: &output,
+                roots: &self.roots,
+            };
+            walk.hidden(false)
                 .git_ignore(false)
                 .git_global(false)
                 .git_exclude(false)
                 .follow_links(false)
-                .filter_entry(|entry| !should_skip(entry.path()))
-                .build()
-                .flatten()
-            {
-                if let Some(entry) =
-                    make_flat(item.path(), item.file_type().map(|kind| kind.is_dir()))
-                {
-                    additions.push(entry);
+                .threads(rayon::current_num_threads().min(8))
+                .build_parallel()
+                .visit(&mut visitor);
+        }
+        let changed = additions.len() + removed_prefixes.len();
+        Ok(IndexDelta {
+            additions,
+            removed_prefixes,
+            opaque,
+            changed,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DeltaVisitors<'a, 'b> {
+    output: &'a Mutex<(&'b mut Vec<FlatEntry>, &'b mut HashSet<u64>)>,
+    roots: &'a [PathBuf],
+}
+struct DeltaVisitor<'a, 'b> {
+    shared: DeltaVisitors<'a, 'b>,
+    entries: Vec<FlatEntry>,
+    opaque: HashSet<u64>,
+}
+impl<'s> ignore::ParallelVisitorBuilder<'s> for DeltaVisitors<'s, '_> {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
+        Box::new(DeltaVisitor {
+            shared: *self,
+            entries: Vec::new(),
+            opaque: HashSet::new(),
+        })
+    }
+}
+impl ignore::ParallelVisitor for DeltaVisitor<'_, '_> {
+    fn visit(&mut self, item: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
+        match item {
+            Ok(item) => {
+                let path = item.path();
+                if !sync_path(path, self.shared.roots) {
+                    self.opaque.insert(hash_path(&path.to_string_lossy()));
+                    return WalkState::Skip;
                 }
+                self.entries
+                    .extend(make_flat(path, item.file_type().map(|kind| kind.is_dir())));
             }
-        } else if path.exists() {
-            if let Some(entry) = make_flat(path, Some(false)) {
-                additions.push(entry);
+            Err(ignore::Error::WithPath { path, .. }) => {
+                self.opaque.insert(hash_path(&path.to_string_lossy()));
             }
+            Err(_) => (),
+        }
+        WalkState::Continue
+    }
+}
+impl Drop for DeltaVisitor<'_, '_> {
+    fn drop(&mut self) {
+        let mut out = self.shared.output.lock().unwrap();
+        out.0.append(&mut self.entries);
+        out.1.extend(self.opaque.drain());
+    }
+}
+
+pub fn checkpoint_journal(index: &CompactIndex, end: u64) -> Result<(), String> {
+    let dir = data_dir()?;
+    checkpoint_to(
+        index,
+        end,
+        &dir.join("index-v3.bin"),
+        &dir.join("modified-v1.bin"),
+        &dir.join(JOURNAL_NAME),
+    )
+}
+
+fn checkpoint_to(
+    index: &CompactIndex,
+    end: u64,
+    snapshot: &Path,
+    dates: &Path,
+    journal: &Path,
+) -> Result<(), String> {
+    write_snapshot(index, snapshot, dates)?;
+    acknowledge_journal(journal, end)
+}
+
+pub fn acknowledge_applied(end: u64) -> Result<(), String> {
+    acknowledge_journal(&journal_path()?, end)
+}
+
+// A later or unapplied batch always stays replayable. Only the single UI writer
+// acknowledges batches, while dispatch is paused for a checkpoint.
+fn acknowledge_journal(path: &Path, end: u64) -> Result<(), String> {
+    let _guard = JOURNAL_LOCK.lock().unwrap();
+    if end > 0 {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        if file.metadata().map_err(|e| e.to_string())?.len() == end {
+            file.set_len(0).map_err(|e| e.to_string())?;
         }
     }
-    let changed = removed_prefixes.len() + additions.len();
-    Ok(IndexDelta {
-        removed_prefixes,
-        additions,
-        changed,
-    })
+    Ok(())
 }
 
-fn append_journal(paths: &[PathBuf]) -> Result<(), String> {
-    let mut writer = BufWriter::new(
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(journal_path()?)
-            .map_err(|error| error.to_string())?,
-    );
-    for path in paths {
-        let value = path.to_string_lossy();
-        write_u32(&mut writer, value.len() as u32)?;
-        writer
-            .write_all(value.as_bytes())
-            .map_err(|error| error.to_string())?;
+pub fn journal_length() -> Result<u64, String> {
+    match fs::metadata(journal_path()?) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.to_string()),
     }
-    writer.flush().map_err(|error| error.to_string())
 }
 
-fn read_journal() -> Result<Vec<PathBuf>, String> {
-    let path = journal_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
+pub fn append_journal(paths: &[PathBuf]) -> Result<(), String> {
+    write_journal(&journal_path()?, paths)
+}
+pub fn write_journal(path: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    let _guard = JOURNAL_LOCK.lock().unwrap();
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let start = file.metadata().map_err(|e| e.to_string())?.len();
+    let result = (|| {
+        let mut writer = BufWriter::new(&file);
+        for path in paths {
+            let value = path.to_string_lossy();
+            write_u32(&mut writer, value.len() as u32)?;
+            writer
+                .write_all(value.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+        writer.flush().map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        file.set_len(start).map_err(|e| e.to_string())?;
     }
-    let mut reader = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+    result
+}
+
+fn read_journal(path: &Path, roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let _guard = JOURNAL_LOCK.lock().unwrap();
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut complete_bytes = 0u64;
     let mut paths = Vec::new();
     loop {
         let mut length = [0; 4];
@@ -1462,18 +1760,37 @@ fn read_journal() -> Result<Vec<PathBuf>, String> {
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error.to_string()),
         }
-        let mut bytes = vec![0; u32::from_le_bytes(length) as usize];
+        let length = u32::from_le_bytes(length) as usize;
+        if length > 1024 * 1024 {
+            return Err("变更日志路径长度无效".into());
+        }
+        let mut bytes = vec![0; length];
         match reader.read_exact(&mut bytes) {
-            Ok(()) => paths.push(PathBuf::from(
-                String::from_utf8(bytes).map_err(|error| error.to_string())?,
-            )),
+            Ok(()) => {
+                paths.push(PathBuf::from(
+                    String::from_utf8(bytes).map_err(|e| e.to_string())?,
+                ));
+                complete_bytes += 4 + length as u64;
+            }
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error.to_string()),
         }
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    if reader
+        .get_ref()
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .len()
+        != complete_bytes
+    {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_len(complete_bytes))
+            .map_err(|e| e.to_string())?;
+    }
+    paths.retain(|p| !roots.contains(p) && sync_path(p, roots));
+    Ok(dedup_paths(paths))
 }
 
 pub fn normalize_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -1770,8 +2087,6 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hash
 }
 fn extend_hash(mut hash: u64, name: &[u8]) -> u64 {
-    hash ^= u64::from(b'/');
-    hash = hash.wrapping_mul(0x100000001b3);
     for byte in name {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
@@ -1847,17 +2162,265 @@ mod tests {
         .unwrap()
     }
     fn temp_dir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "suishou-date-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         path
     }
+    #[test]
+    fn journal_leaf_event_recovers_offline_tree_and_siblings_after_restart() {
+        use super::*;
+        let temp = temp_dir();
+        let root = temp.join("home");
+        fs::create_dir(&root).unwrap();
+        let roots = vec![root.clone()];
+        let mut index =
+            CompactIndex::from_flat(roots.clone(), vec![make_flat(&root, None).unwrap()]).unwrap();
+        let (snapshot, dates, journal) = (
+            temp.join("index.bin"),
+            temp.join("dates.bin"),
+            temp.join("changes.log"),
+        );
+        write_snapshot(&index, &snapshot, &dates).unwrap();
+        let books = root.join("orca/projects/elecr-motor/books");
+        let book = books.join("暗访十年.epub");
+        fs::create_dir_all(&books).unwrap();
+        fs::write(&book, b"epub").unwrap();
+        fs::write(root.join("orca/offline-sibling.md"), b"sibling").unwrap();
+        write_journal(&journal, std::slice::from_ref(&book)).unwrap();
+        index = load_compact_with_dates(&snapshot, &dates).unwrap();
+        assert!(search(&index, "暗访十年", 10).is_empty());
+        for _ in 0..2 {
+            let scope = index.delta_scope();
+            let paths = read_journal(&journal, &roots).unwrap();
+            index
+                .apply_delta(scope.collect_delta(paths).unwrap())
+                .unwrap();
+            let hits = search(&index, "暗访十年", 10);
+            assert_eq!(hits.len(), 1);
+            assert_eq!(index.path(hits[0]), book.to_str().unwrap());
+            assert_eq!(search(&index, "offline-sibling", 10).len(), 1);
+        }
+        let applied = journal.metadata().unwrap().len();
+        checkpoint_to(&index, applied, &snapshot, &dates, &journal).unwrap();
+        assert_eq!(journal.metadata().unwrap().len(), 0);
+        let mut restored = load_compact_with_dates(&snapshot, &dates).unwrap();
+        fs::remove_dir_all(&books).unwrap();
+        let delta = restored.delta_scope().collect_delta(vec![books]).unwrap();
+        restored.apply_delta(delta).unwrap();
+        assert!(search(&restored, "暗访十年", 10).is_empty());
+        assert_eq!(search(&restored, "offline-sibling", 10).len(), 1);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn journal_recovers_torn_tail_and_coalesces_only_reported_ancestors() {
+        use super::*;
+        let root = temp_dir();
+        let journal = root.join("changes.log");
+        let parent = root.join("project");
+        let neighbour = root.join("project-backup");
+        let roots = vec![root.clone()];
+        write_journal(
+            &journal,
+            &[
+                parent.join("books/a"),
+                neighbour.clone(),
+                parent.join("b"),
+                parent.clone(),
+                parent.clone(),
+                root.clone(),
+                root.join("Caches/ignore"),
+                PathBuf::from("/outside"),
+            ],
+        )
+        .unwrap();
+        let end = journal.metadata().unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+        file.write_all(&[20, 0, 0, 0, b'x']).unwrap();
+        assert_eq!(
+            read_journal(&journal, &roots).unwrap(),
+            [parent.clone(), neighbour]
+        );
+        assert_eq!(journal.metadata().unwrap().len(), end);
+        let independent = (0..80)
+            .map(|i| root.join(format!("branch-{i}/leaf")))
+            .collect::<Vec<_>>();
+        write_journal(&journal, &independent).unwrap();
+        acknowledge_journal(&journal, end).unwrap();
+        assert_eq!(read_journal(&journal, &roots).unwrap().len(), 82);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_retains_journal_on_date_write_failure_and_restores_partial_dates() {
+        use super::*;
+        let root = temp_dir();
+        let index_file = root.join("index.bin");
+        let dates = root.join("dates.bin");
+        let journal = root.join("changes.log");
+        let mut index = sample();
+        index.records[1].modified = UNCACHED_DATE;
+        index.records[2].modified = 77;
+        index.dates_ready = false;
+        write_journal(&journal, &[PathBuf::from("/tmp/changed")]).unwrap();
+        let end = journal.metadata().unwrap().len();
+        assert!(
+            checkpoint_to(
+                &index,
+                end,
+                &index_file,
+                &root.join("absent/dates"),
+                &journal
+            )
+            .is_err()
+        );
+        assert_eq!(journal.metadata().unwrap().len(), end);
+        checkpoint_to(&index, end, &index_file, &dates, &journal).unwrap();
+        assert_eq!(journal.metadata().unwrap().len(), 0);
+        let restored = load_compact_with_dates(&index_file, &dates).unwrap();
+        assert!(!restored.dates_ready());
+        assert_eq!(restored.modified(2), Some(77));
+        assert_eq!(restored.missing_date_batch(&mut 0).len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reloaded_filesystem_root_retains_directory_hashes_for_delta_lookup() {
+        use super::*;
+        let root = temp_dir();
+        let flat = [("/", true), ("/Users", true), ("/Users/file", false)]
+            .map(|(path, is_dir)| FlatEntry {
+                path: path.into(),
+                is_dir,
+                modified: UNKNOWN_DATE,
+            })
+            .to_vec();
+        let index = CompactIndex::from_flat(vec!["/".into()], flat).unwrap();
+        let file = root.join("snap.bin");
+        write_snapshot(&index, &file, &root.join("dates.bin")).unwrap();
+        let restored = load_compact(&file).unwrap();
+        assert_eq!(restored.path_hashes, index.path_hashes);
+        assert_eq!(restored.directory_ids, index.directory_ids);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watcher_noise_respects_explicit_roots_and_path_boundaries() {
+        use super::*;
+        let roots = vec![PathBuf::from("/")];
+        for path in [
+            "/private/var/folders/x",
+            "/private/tmp",
+            "/System/Volumes/Update/a",
+            "/Users/test/Library/Caches/a",
+            "/Volumes/data/Caches/x",
+            "/Users/test/Library/Application Support/com.gkgy.MiaoFind/index-v3.tmp",
+            "/Users/test/Library/Application Support/随手找/app.ron",
+        ] {
+            assert!(!sync_path(Path::new(path), &roots), "{path}");
+        }
+        for path in [
+            "/Users/test/orca/file",
+            "/Volumes/data/Models/a",
+            "/Users/test/Caches-old/x",
+            "/private/tmp-notes",
+        ] {
+            assert!(sync_path(Path::new(path), &roots), "{path}");
+        }
+        let custom = PathBuf::from("/private/tmp/project/Caches");
+        assert!(sync_path(
+            &custom.join("source"),
+            std::slice::from_ref(&custom)
+        ));
+        assert!(!sync_path(Path::new("/private/tmp/other"), &[custom]));
+    }
+
+    #[test]
+    fn delta_skips_cache_contents_without_losing_full_disk_records() {
+        use super::*;
+        let root = temp_dir();
+        let project = root.join("project");
+        let cache = project.join("Caches");
+        fs::create_dir_all(&cache).unwrap();
+        let old = cache.join("old-cache");
+        let fresh = cache.join("fresh-cache");
+        fs::write(&old, b"").unwrap();
+        let roots = vec![root.clone()];
+        let flat = [&root, &project, &cache, &old]
+            .map(|p| make_flat(p, None).unwrap())
+            .to_vec();
+        let mut index = CompactIndex::from_flat(roots, flat).unwrap();
+        fs::write(&fresh, b"").unwrap();
+        fs::write(project.join("project-document"), b"").unwrap();
+        index
+            .apply_delta(
+                index
+                    .delta_scope()
+                    .collect_delta(vec![project.clone()])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(search(&index, "old-cache", 10).len(), 1);
+        assert!(search(&index, "fresh-cache", 10).is_empty());
+        assert_eq!(search(&index, "project-document", 10).len(), 1);
+        fs::remove_dir_all(project).unwrap();
+        index
+            .apply_delta(
+                index
+                    .delta_scope()
+                    .collect_delta(vec![root.join("project")])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(search(&index, "old-cache", 10).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn personal_apps_show_bundles_in_both_locations_and_hide_internals() {
+        use super::*;
+        let root = temp_dir();
+        let system = root.join("Applications");
+        let home = root.join("home");
+        let user_apps = home.join("Applications");
+        let cache = home.join("Caches");
+        let mut flat: Vec<_> = [&root, &system, &home, &user_apps, &cache]
+            .map(|p| make_flat(p, Some(true)).unwrap())
+            .to_vec();
+        for dir in [&user_apps, &system] {
+            let app = dir.join("Editor.app");
+            flat.push(make_flat(&app, Some(true)).unwrap());
+            flat.push(make_flat(&app.join("Contents"), Some(true)).unwrap());
+        }
+        let index = CompactIndex::from_flat(vec![root.clone()], flat).unwrap();
+        let roots = [system, home];
+        let mask = index.personal_mask(&roots);
+        let visible = |name, mask: &[bool]| {
+            search(&index, name, 20)
+                .into_iter()
+                .filter(|&id| index.name(id) == name && mask[id])
+                .count()
+        };
+        assert_eq!(visible("Editor.app", &mask), 2);
+        assert_eq!(visible("Contents", &mask), 0);
+        assert_eq!(visible("Caches", &mask), 0);
+        let explicit = index.personal_mask(&[user_apps.join("Editor.app")]);
+        assert_eq!(visible("Contents", &explicit), 1);
+        assert_eq!(
+            visible(
+                "Contents",
+                &index.personal_mask_with_exclusions(&roots, &[])
+            ),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn relevant_main_apps_precede_helpers_but_manual_dates_stay_global() {
         use super::{Category, SortOrder, search_sorted_with_scope};
@@ -2130,6 +2693,7 @@ mod tests {
                 removed_prefixes: vec!["/tmp/z-common.PNG".into()],
                 additions: vec![],
                 changed: 1,
+                opaque: Default::default(),
             })
             .unwrap();
         assert!(search_filtered(&index, "common", 1, Category::Image).is_empty());
